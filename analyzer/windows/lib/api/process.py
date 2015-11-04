@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 Cuckoo Foundation, Accuvant, Inc. (bspengler@accuvant.com)
+# Copyright (C) 2010-2015 Cuckoo Foundation, Optiv, Inc. (brad.spengler@optiv.com)
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -7,11 +7,15 @@ import logging
 import random
 import subprocess
 import platform
+import urllib
+import base64
 from time import time
 from ctypes import byref, c_ulong, create_string_buffer, c_int, sizeof
 from shutil import copy
 
 from lib.common.constants import PIPE, PATHS, SHUTDOWN_MUTEX, TERMINATE_EVENT
+from lib.common.constants import CUCKOOMON32_NAME, CUCKOOMON64_NAME, LOADER32_NAME, LOADER64_NAME
+from lib.common.defines import ULONG_PTR
 from lib.common.defines import KERNEL32, NTDLL, SYSTEM_INFO, STILL_ACTIVE
 from lib.common.defines import THREAD_ALL_ACCESS, PROCESS_ALL_ACCESS, TH32CS_SNAPPROCESS
 from lib.common.defines import STARTUPINFO, PROCESS_INFORMATION, PROCESSENTRY32
@@ -25,6 +29,7 @@ from lib.common.errors import get_error_string
 from lib.common.rand import random_string
 from lib.common.results import NetlogFile
 from lib.core.config import Config
+from lib.core.log import LogServer
 
 IOCTL_PID = 0x222008
 IOCTL_CUCKOO_PATH = 0x22200C
@@ -35,18 +40,21 @@ log = logging.getLogger(__name__)
 def is_os_64bit():
     return platform.machine().endswith('64')
 
-def randomize_dll(dll_path):
-    """Randomize DLL name.
-    @return: new DLL path.
+def get_referrer_url(interest):
+    """Get a Google referrer URL
+    @return: URL to be added to the analysis config
     """
-    new_dll_name = random_string(6)
-    new_dll_path = os.path.join(os.getcwd(), "dll", "{0}.dll".format(new_dll_name))
 
-    try:
-        copy(dll_path, new_dll_path)
-        return new_dll_path
-    except:
-        return dll_path
+    if "://" not in interest:
+        return ""
+
+    escapedurl = urllib.quote(interest, '')
+    itemidx = str(random.randint(1, 30))
+    vedstr = "0CCEQfj" + base64.urlsafe_b64encode(random_string(random.randint(5, 8) * 3))
+    eistr = base64.urlsafe_b64encode(random_string(12))
+    usgstr = "AFQj" + base64.urlsafe_b64encode(random_string(12))
+    referrer = "http://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd={0}&ved={1}&url={2}&ei={3}&usg={4}".format(itemidx, vedstr, escapedurl, eistr, usgstr)
+    return referrer
 
 class Process:
     """Windows process."""
@@ -68,6 +76,8 @@ class Process:
         self.h_thread = h_thread
         self.suspended = suspended
         self.system_info = SYSTEM_INFO()
+        self.logserver_path = "\\\\.\\PIPE\\" + random_string(8, 12)
+        self.logserver = None
 
     def __del__(self):
         """Close open handles."""
@@ -190,8 +200,8 @@ class Process:
 
         NT_SUCCESS = lambda val: val >= 0
 
-        pbi = (c_int * 6)()
-        size = c_int()
+        pbi = (ULONG_PTR * 6)()
+        size = c_ulong()
 
         # Set return value to signed 32bit integer.
         NTDLL.NtQueryInformationProcess.restype = c_int
@@ -404,8 +414,6 @@ class Process:
         if self.h_process == 0:
             self.open()
 
-        self.set_terminate_event()
-
         if KERNEL32.TerminateProcess(self.h_process, 1):
             log.info("Successfully terminated process with pid %d.", self.pid)
             return True
@@ -509,11 +517,13 @@ class Process:
         is_64bit = self.is_64bit()
         if not dll:
             if is_64bit:
-                dll = "cuckoomon_x64.dll"
+                dll = CUCKOOMON64_NAME
             else:
-                dll = "cuckoomon.dll"
+                dll = CUCKOOMON32_NAME
+        else:
+            os.path.join("dll", dll)
 
-        dll = randomize_dll(os.path.join("dll", dll))
+        dll = os.path.join(os.getcwd(), dll)
 
         if not dll or not os.path.exists(dll):
             log.warning("No valid DLL specified to be injected in process "
@@ -525,11 +535,15 @@ class Process:
             cfg = Config("analysis.conf")
             cfgoptions = cfg.get_options()
 
+            # start the logserver for this monitored process
+            self.logserver = LogServer(cfg.ip, cfg.port, self.logserver_path)
+
             firstproc = Process.first_process
 
             config.write("host-ip={0}\n".format(cfg.ip))
             config.write("host-port={0}\n".format(cfg.port))
             config.write("pipe={0}\n".format(PIPE))
+            config.write("logserver={0}\n".format(self.logserver_path))
             config.write("results={0}\n".format(PATHS["root"]))
             config.write("analyzer={0}\n".format(os.getcwd()))
             config.write("first-process={0}\n".format("1" if firstproc else "0"))
@@ -545,7 +559,18 @@ class Process:
                 config.write("full-logs={0}\n".format(cfgoptions["full-logs"]))
             if "no-stealth" in cfgoptions:
                 config.write("no-stealth={0}\n".format(cfgoptions["no-stealth"]))
-
+            if "serial" in cfgoptions:
+                config.write("serial={0}\n".format(cfgoptions["serial"]))
+            if "sysvol_ctimelow" in cfgoptions:
+                config.write("sysvol_ctimelow={0}\n".format(cfgoptions["sysvol_ctimelow"]))
+            if "sysvol_ctimehigh" in cfgoptions:
+                config.write("sysvol_ctimehigh={0}\n".format(cfgoptions["sysvol_ctimehigh"]))
+            if "sys32_ctimelow" in cfgoptions:
+                config.write("sys32_ctimelow={0}\n".format(cfgoptions["sys32_ctimelow"]))
+            if "sys32_ctimehigh" in cfgoptions:
+                config.write("sys32_ctimehigh={0}\n".format(cfgoptions["sys32_ctimehigh"]))
+            if "norefer" not in cfgoptions:
+                config.write("referrer={0}\n".format(get_referrer_url(interest)))
             if firstproc:
                 Process.first_process = False
 
@@ -554,14 +579,16 @@ class Process:
         else:
             log.debug("Using CreateRemoteThread injection.")
 
-        bin_name = ""
+        orig_bin_name = ""
         bit_str = ""
         if is_64bit:
-            bin_name = "bin/loader_x64.exe"
+            orig_bin_name = LOADER64_NAME
             bit_str = "64-bit"
         else:
-            bin_name = "bin/loader.exe"
+            orig_bin_name = LOADER32_NAME
             bit_str = "32-bit"
+
+        bin_name = os.path.join(os.getcwd(), orig_bin_name)
 
         if os.path.exists(bin_name):
             ret = subprocess.call([bin_name, "inject", str(self.pid), str(thread_id), dll])
@@ -592,39 +619,43 @@ class Process:
 
         bin_name = ""
         bit_str = ""
-        file_path = os.path.join(PATHS["memory"], "%d.dmp".format(self.pid))
+        file_path = os.path.join(PATHS["memory"], "{0}.dmp".format(self.pid))
+
         if self.is_64bit():
-            bin_name = "bin/loader_x64.exe"
+            orig_bin_name = LOADER64_NAME
             bit_str = "64-bit"
         else:
-            bin_name = "bin/loader.exe"
+            orig_bin_name = LOADER32_NAME
             bit_str = "32-bit"
+
+        bin_name = os.path.join(os.getcwd(), orig_bin_name)
 
         if os.path.exists(bin_name):
             ret = subprocess.call([bin_name, "dump", str(self.pid), file_path])
-            if ret != 0:
-                if ret == 1:
-                    log.info("Dumped %s process with pid %d", bit_str, self.pid)
-                else:
-                    log.error("Unable to dump %s process with pid %d, error: %d", bit_str, self.pid, ret)
-                return False
+            if ret == 1:
+                log.info("Dumped %s process with pid %d", bit_str, self.pid)
             else:
-                return True
+                log.error("Unable to dump %s process with pid %d, error: %d", bit_str, self.pid, ret)
+                return False
         else:
             log.error("Please place the %s binary from cuckoomon into analyzer/windows/bin in order to analyze %s binaries.", os.path.basename(bin_name), bit_str)
             return False
 
-        nf = NetlogFile(os.path.join("memory", "%s.dmp" % str(self.pid)))
+        nf = NetlogFile(os.path.join("memory", "{0}.dmp".format(self.pid)))
         infd = open(file_path, "rb")
         buf = infd.read(1024*1024)
         try:
             while buf:
-                nf.send(buf, retry=False)
+                nf.send(buf, retry=True)
                 buf = infd.read(1024*1024)
-            nf.close()
         except:
+            infd.close()
+            nf.close()
             log.warning("Memory dump of process with pid %d failed", self.pid)
             return False
+
+        infd.close()
+        nf.close()
 
         log.info("Memory dump of process with pid %d completed", self.pid)
 

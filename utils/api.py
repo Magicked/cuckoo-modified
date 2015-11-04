@@ -15,7 +15,7 @@ from zipfile import ZipFile, ZIP_STORED
 
 try:
     from bottle import route, run, request, hook, response, HTTPError
-    from bottle import default_app
+    from bottle import default_app, BaseRequest
 except ImportError:
     sys.exit("ERROR: Bottle.py library is missing")
 
@@ -23,10 +23,14 @@ sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
 
 from lib.cuckoo.common.constants import CUCKOO_VERSION, CUCKOO_ROOT
 from lib.cuckoo.common.utils import store_temp_file, delete_folder
+from lib.cuckoo.common.email_utils import find_attachments_in_email
 from lib.cuckoo.core.database import Database, TASK_RUNNING, Task
 
 # Global DB pointer.
 db = Database()
+
+# Increase request size limit
+BaseRequest.MEMFILE_MAX = 1024 * 1024 * 4
 
 def jsonize(data):
     """Converts data dict to JSON.
@@ -255,7 +259,7 @@ def tasks_report(task_id, report_format="json"):
             s = StringIO()
 
             # By default go for bz2 encoded tar files (for legacy reasons.)
-            tarmode = tar_formats.get(request.get("tar"), "w:bz2")
+            tarmode = tar_formats.get(request.GET.get("tar"), "w:bz2")
 
             tar = tarfile.open(fileobj=s, mode=tarmode)
             for filedir in os.listdir(srcdir):
@@ -276,15 +280,19 @@ def tasks_report(task_id, report_format="json"):
 
 @route("/files/view/md5/<md5>", method="GET")
 @route("/v1/files/view/md5/<md5>", method="GET")
+@route("/files/view/sha1/<md5>", method="GET")
+@route("/v1/files/view/sha1/<md5>", method="GET")
 @route("/files/view/sha256/<sha256>", method="GET")
 @route("/v1/files/view/sha256/<sha256>", method="GET")
 @route("/files/view/id/<sample_id:int>", method="GET")
 @route("/v1/files/view/id/<sample_id:int>", method="GET")
-def files_view(md5=None, sha256=None, sample_id=None):
+def files_view(md5=None, sha1=None, sha256=None, sample_id=None):
     response = {}
 
     if md5:
         sample = db.find_sample(md5=md5)
+    elif sha1:
+        sample = db.find_sample(sha1=sha1)
     elif sha256:
         sample = db.find_sample(sha256=sha256)
     elif sample_id:

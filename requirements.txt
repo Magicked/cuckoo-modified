@@ -1,10 +1,10 @@
 sqlalchemy
-bson
 jinja2
 pymongo
 bottle
 pefile
 django
+django-ratelimit
 chardet
 nose
 jsbeautifier

@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 Cuckoo Foundation, Accuvant, Inc. (bspengler@accuvant.com).
+# Copyright (C) 2010-2015 Cuckoo Foundation, Optiv, Inc. (brad.spengler@optiv.com).
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -43,6 +43,7 @@ class Auxiliary(object):
         self.task = None
         self.machine = None
         self.options = None
+        self.db = Database()
 
     def set_task(self, task):
         self.task = task
@@ -150,7 +151,7 @@ class Machinery(object):
                                     resultserver_port=port)
             except (AttributeError, CuckooOperationalError) as e:
                 log.warning("Configuration details about machine %s "
-                            "are missing: %s", machine_id, e)
+                            "are missing: %s", machine_id.strip(), e)
                 continue
 
     def _initialize_check(self):
@@ -641,6 +642,12 @@ class Processing(object):
         self.pmemory_path = os.path.join(self.analysis_path, "memory")
         self.memory_path = os.path.join(self.analysis_path, "memory.dmp")
 
+    def add_statistic(self, name, field, value):
+        if name not in self.results["statistics"]["processing"]:
+            self.results["statistics"]["processing"][name] = { }
+
+        self.results["statistics"]["processing"][name][field] = value
+
     def run(self):
         """Start processing.
         @raise NotImplementedError: this method is abstract.
@@ -673,6 +680,7 @@ class Signature(object):
     filter_processnames = set()
     filter_apinames = set()
     filter_categories = set()
+    filter_analysistypes = set()
 
     def __init__(self, results=None):
         self.data = []
@@ -682,6 +690,12 @@ class Signature(object):
         self._current_call_dict = None
         self._current_call_raw_cache = None
         self._current_call_raw_dict = None
+
+    def add_statistic(self, name, field, value):
+        if name not in self.results["statistics"]["signatures"]:
+            self.results["statistics"]["signatures"][name] = { }
+
+        self.results["statistics"]["signatures"][name][field] = value
 
     def _check_value(self, pattern, subject, regex=False, all=False, ignorecase=True):
         """Checks a pattern against a given subject.
@@ -880,6 +894,24 @@ class Signature(object):
                                  all=all,
                                  ignorecase=False)
 
+    def check_started_service(self, pattern, regex=False, all=False):
+        """Checks for a service being started.
+        @param pattern: string or expression to check for.
+        @param regex: boolean representing if the pattern is a regular
+                      expression or not and therefore should be compiled.
+        @param all: boolean representing if all results should be returned
+                      in a set or not
+        @return: depending on the value of param 'all', either a set of
+                      matched items or the first matched item
+        """
+        subject = self.results["behavior"]["summary"]["started_services"]
+        return self._check_value(pattern=pattern,
+                                 subject=subject,
+                                 regex=regex,
+                                 all=all,
+                                 ignorecase=True)
+
+
     def check_executed_command(self, pattern, regex=False, all=False, ignorecase=True):
         """Checks for a command being executed.
         @param pattern: string or expression to check for.
@@ -945,7 +977,8 @@ class Signature(object):
                             api=None,
                             category=None,
                             regex=False,
-                            all=False):
+                            all=False,
+                            ignorecase=False):
         """Checks for a specific argument of an invoked API.
         @param call: API call information.
         @param pattern: string or expression to check for.
@@ -956,6 +989,8 @@ class Signature(object):
                       expression or not and therefore should be compiled.
         @param all: boolean representing if all results should be returned
                       in a set or not
+        @param ignorecase: boolean representing whether the search is
+                    case-insensitive or not
         @return: depending on the value of param 'all', either a set of
                       matched items or the first matched item
         """
@@ -984,7 +1019,7 @@ class Signature(object):
                                  subject=argument["value"],
                                  regex=regex,
                                  all=all,
-                                 ignorecase=False)
+                                 ignorecase=ignorecase)
             if ret:
                 if all:
                     retset.update(ret)
@@ -1003,7 +1038,8 @@ class Signature(object):
                        category=None,
                        process=None,
                        regex=False,
-                       all=False):
+                       all=False,
+                       ignorecase=False):
         """Checks for a specific argument of an invoked API.
         @param pattern: string or expression to check for.
         @param name: optional filter for the argument name.
@@ -1014,6 +1050,8 @@ class Signature(object):
                       expression or not and therefore should be compiled.
         @param all: boolean representing if all results should be returned
                       in a set or not
+        @param ignorecase: boolean representing whether the search is
+                    case-insensitive or not
         @return: depending on the value of param 'all', either a set of
                       matched items or the first matched item
         """
@@ -1030,7 +1068,7 @@ class Signature(object):
             # Loop through API calls.
             for call in item["calls"]:
                 r = self.check_argument_call(call, pattern, name,
-                                             api, category, regex, all)
+                                             api, category, regex, all, ignorecase)
                 if r:
                     if all:
                         retset.update(r)
@@ -1154,6 +1192,27 @@ class Signature(object):
 
         return None
 
+    def get_initial_process(self):
+        """ Obtains the initial process information
+        @return: dict containing initial process information or None
+        """
+
+        if not "behavior" in self.results or not "processes" in self.results["behavior"] or not len(self.results["behavior"]["processes"]):
+            return None
+
+        return self.results["behavior"]["processes"][0]
+
+    def get_environ_entry(self, proc, env_name):
+        """ Obtains environment entry from process
+        @param proc: Process to inspect
+        @param env_name: Name of environment entry
+        @return: value of environment entry or None
+        """
+        if not proc or not "environ" in proc or not env_name in proc["environ"]:
+            return None
+
+        return proc["environ"][env_name]
+
     def get_argument(self, call, name):
         """Retrieves the value of a specific argument from an API call.
         @param call: API call object.
@@ -1255,6 +1314,8 @@ class Signature(object):
             name=self.name,
             description=self.description,
             severity=self.severity,
+            weight=self.weight,
+            confidence=self.confidence,
             references=self.references,
             data=self.data,
             new_data=self.new_data,

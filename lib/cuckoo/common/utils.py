@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 Cuckoo Foundation, Accuvant, Inc. (bspengler@accuvant.com)
+# Copyright (C) 2010-2015 Cuckoo Foundation, Optiv, Inc. (brad.spengler@optiv.com)
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -13,10 +13,17 @@ import errno
 import inspect
 import threading
 import multiprocessing
+import operator
 from datetime import datetime
+from collections import defaultdict
 
 from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.config import Config
+
+try:
+    import re2 as re
+except ImportError:
+    import re
 
 try:
     import chardet
@@ -67,6 +74,8 @@ def delete_folder(folder):
 PRINTABLE_CHARACTERS = \
     string.letters + string.digits + string.punctuation + " \t\r\n"
 
+FILENAME_CHARACTERS = string.letters + string.digits + string.punctuation.replace("/", "") + " "
+
 def convert_char(c):
     """Escapes characters.
     @param c: dirty char.
@@ -81,6 +90,23 @@ def is_printable(s):
     """ Test if a string is printable."""
     for c in s:
         if c not in PRINTABLE_CHARACTERS:
+            return False
+    return True
+
+def convert_filename_char(c):
+    """Escapes filename characters.
+    @param c: dirty char.
+    @return: sanitized char.
+    """
+    if c in FILENAME_CHARACTERS:
+        return c
+    else:
+        return "\\x%02x" % ord(c)
+
+def is_sane_filename(s):
+    """ Test if a filename is sane."""
+    for c in s:
+        if c not in FILENAME_CHARACTERS:
             return False
     return True
 
@@ -99,6 +125,16 @@ def convert_to_printable(s, cache=None):
         cache[s] = "".join(convert_char(c) for c in s)
     return cache[s]
 
+def sanitize_pathname(s):
+    """Sanitize filename.
+    @param s: string.
+    @return: sanitized filename.
+    """
+    if is_sane_filename(s):
+        return s
+
+    return "".join(convert_filename_char(c) for c in s)
+
 def pretty_print_retval(category, api_name, status, retval):
     """Creates pretty-printed versions of an API return value
     @return: pretty-printed version of the call's return value, or None if no conversion exists
@@ -107,13 +143,16 @@ def pretty_print_retval(category, api_name, status, retval):
         return None
     val = None
     try:
-        val = long(retval, 16)
+        val = long(retval, 16) & 0xffffffff
     except ValueError:
         return None
     return {
             0x00000103 : "NO_MORE_ITEMS",
+            0x00002af9 : "WSAHOST_NOT_FOUND",
             0x80000005 : "BUFFER_OVERFLOW",
             0x80000006 : "NO_MORE_FILES",
+            0x8000000a : "HANDLES_CLOSED",
+            0x8000001a : "NO_MORE_ENTRIES",
             0xc0000001 : "UNSUCCESSFUL",
             0xc0000002 : "NOT_IMPLEMENTED",
             0xc0000004 : "INFO_LENGTH_MISMATCH",
@@ -129,16 +168,21 @@ def pretty_print_retval(category, api_name, status, retval):
             0xc0000024 : "OBJECT_TYPE_MISMATCH",
             0xc0000033 : "OBJECT_NAME_INVALID",
             0xc0000034 : "OBJECT_NAME_NOT_FOUND",
+            0xc0000035 : "OBJECT_NAME_COLLISION",
             0xc0000039 : "OBJECT_PATH_INVALID",
             0xc000003a : "OBJECT_PATH_NOT_FOUND",
             0xc000003c : "DATA_OVERRUN",
             0xc0000043 : "SHARING_VIOLATION",
+            0xc0000045 : "INVALID_PAGE_PROTECTION",
+            0xc000007a : "PROCEDURE_NOT_FOUND",
+            0xc00000ac : "PIPE_NOT_AVAILABLE",
             0xc00000ba : "FILE_IS_A_DIRECTORY",
             0xc000010a : "PROCESS_IS_TERMINATING",
             0xc0000121 : "CANNOT_DELETE",
             0xc0000135 : "DLL_NOT_FOUND",
             0xc0000139 : "ENTRYPOINT_NOT_FOUND",
             0xc0000142 : "DLL_INIT_FAILED",
+            0xc000014b : "PIPE_BROKEN",
             0xc0000225 : "NOT_FOUND"
     }.get(val, None)
 
@@ -208,6 +252,9 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
                 0x8002 : "MD4",
                 0x8003 : "MD5",
                 0x8004 : "SHA1",
+                0x800c : "SHA_256",
+                0x800d : "SHA_384",
+                0x800e : "SHA_512",
                 0x8005 : "MAC",
                 0x8009 : "HMAC",
                 0x2400 : "RSA Public Key Signature",
@@ -215,9 +262,26 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
                 0xa400 : "RSA Public Key Exchange",
                 0x6602 : "RC2",
                 0x6801 : "RC4",
+                0x660d : "RC5",
                 0x6601 : "DES",
                 0x6603 : "3DES",
-                0x6609 : "Two-key 3DES"
+                0x6604 : "DESX",
+                0x6609 : "Two-key 3DES",
+                0x6611 : "AES",
+                0x660e : "AES_128",
+                0x660f : "AES_192",
+                0x6610 : "AES_256",
+                0xaa03 : "AGREEDKEY_ANY",
+                0x660c : "CYLINK_MEK",
+                0xaa02 : "DH_EPHEM",
+                0xaa01 : "DH_SF",
+                0x2200 : "DSS_SIGN",
+                0xaa05 : "ECDH",
+                0x2203 : "ECDSA",
+                0xa001 : "ECMQV",
+                0x800b : "HASH_REPLACE_OWF",
+                0xa003 : "HUGHES_MD5",
+                0x2000 : "NO_SIGN",
         }.get(val, None)
     elif api_name == "SHGetFolderPathW" and arg_name == "Folder":
         val = int(arg_val, 16)
@@ -352,6 +416,23 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
         if val:
             res.append("0x{0:08x}".format(val))
         return "|".join(res)
+    elif arg_name == "SystemInformationClass":
+        val = int(arg_val, 10)
+        return {
+                0 : "SystemBasicInformation",
+                1 : "SystemExceptionInformation",
+                2 : "SystemInterruptInformation",
+                3 : "SystemLookasideInformation",
+                4 : "SystemPerformanceInformation",
+                5 : "SystemProcessInformation",
+                8 : "SystemProcessorPerformanceInformation",
+                21 : "SystemFileCacheInformation",
+                35 : "SystemKernelDebuggerInformation",
+                44 : "SystemCurrentTimeZoneInformation",
+                66 : "SystemDynamicTimeZoneInformation",
+                90 : "SystemBootEnvironmentInformation",
+                123 : "SystemBasicPerformanceInformation",
+        }.get(val, None)
     elif category == "registry" and arg_name == "Type":
         val = int(arg_val, 16)
         return {
@@ -540,6 +621,7 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
                 0x4d008 : "IOCTL_SCSI_MINIPORT",
                 0x4d014 : "IOCTL_SCSI_PASS_THROUGH_DIRECT",
                 0x70000 : "IOCTL_DISK_GET_DRIVE_GEOMETRY",
+                0x700a0 : "IOCTL_DISK_GET_DRIVE_GEOMETRY_EX",
                 0x7405c : "IOCTL_DISK_GET_LENGTH_INFO",
                 0x90018 : "FSCTL_LOCK_VOLUME",
                 0x9001c : "FSCTL_UNLOCK_VOLUME",
@@ -829,9 +911,9 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
             res.append("PROCESS_ALL_ACCESS")
             val &= ~0x1fffff
         # for < vista
-        if (val & 0x1f03ff) == 0x1f0fff:
+        if (val & 0x1f0fff) == 0x1f0fff:
             res.append("PROCESS_ALL_ACCESS")
-            val &= ~0x1f03ff
+            val &= ~0x1f0fff
         val &= ~remove
         if val & 0x0001:
             res.append("PROCESS_TERMINATE")
@@ -941,6 +1023,69 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
         if val:
             res.append("0x{0:08x}".format(val))
         return "|".join(res)
+    elif api_name == "CoInternetSetFeatureEnabled" and arg_name == "FeatureEntry":
+        val = int(arg_val, 10)
+        return {
+              0 : "FEATURE_OBJECT_CACHING",
+              1 : "FEATURE_ZONE_ELEVATION",
+              2 : "FEATURE_MIME_HANDLING",
+              3 : "FEATURE_MIME_SNIFFING",
+              4 : "FEATURE_WINDOW_RESTRICTIONS",
+              5 : "FEATURE_WEBOC_POPUPMANAGEMENT",
+              6 : "FEATURE_BEHAVIORS",
+              7 : "FEATURE_DISABLE_MK_PROTOCOL",
+              8 : "FEATURE_LOCALMACHINE_LOCKDOWN",
+              9 : "FEATURE_SECURITYBAND",
+              10 : "FEATURE_RESTRICT_ACTIVEXINSTALL",
+              11 : "FEATURE_VALIDATE_NAVIGATE_URL",
+              12 : "FEATURE_RESTRICT_FILEDOWNLOAD",
+              13 : "FEATURE_ADDON_MANAGEMENT",
+              14 : "FEATURE_PROTOCOL_LOCKDOWN",
+              15 : "FEATURE_HTTP_USERNAME_PASSWORD_DISABLE",
+              16 : "FEATURE_SAFE_BINDTOOBJECT",
+              17 : "FEATURE_UNC_SAVEDFILECHECK",
+              18 : "FEATURE_GET_URL_DOM_FILEPATH_UNENCODED",
+              19 : "FEATURE_TABBED_BROWSING",
+              20 : "FEATURE_SSLUX",
+              21 : "FEATURE_DISABLE_NAVIGATION_SOUNDS",
+              22 : "FEATURE_DISABLE_LEGACY_COMPRESSION",
+              23 : "FEATURE_FORCE_ADDR_AND_STATUS",
+              24 : "FEATURE_XMLHTTP",
+              25 : "FEATURE_DISABLE_TELNET_PROTOCOL",
+              26 : "FEATURE_FEEDS",
+              27 : "FEATURE_BLOCK_INPUT_PROMPTS"
+        }.get(val, None)
+    elif api_name == "CoInternetSetFeatureEnabled" and arg_name == "Flags":
+        val = int(arg_val, 16)
+        res = []
+        if val & 0x00000001:
+            res.append("SET_FEATURE_ON_THREAD")
+            val &= ~0x00000001
+        if val & 0x00000002:
+            res.append("SET_FEATURE_ON_PROCESS")
+            val &= ~0x00000002
+        if val & 0x00000004:
+            res.append("SET_FEATURE_IN_REGISTRY")
+            val &= ~0x00000004
+        if val & 0x00000008:
+            res.append("SET_FEATURE_ON_THREAD_LOCALMACHINE")
+            val &= ~0x00000008
+        if val & 0x00000010:
+            res.append("SET_FEATURE_ON_THREAD_INTRANET")
+            val &= ~0x00000010
+        if val & 0x00000020:
+            res.append("SET_FEATURE_ON_THREAD_TRUSTED")
+            val &= ~0x00000020
+        if val & 0x00000040:
+            res.append("SET_FEATURE_ON_THREAD_INTERNET")
+            val &= ~0x00000040
+        if val & 0x00000080:
+            res.append("SET_FEATURE_ON_THREAD_RESTRICTED")
+            val &= ~0x00000080
+        if val:
+            res.append("0x{0:08x}".format(val))
+        return "|".join(res)
+
     elif api_name == "InternetSetOptionA" and arg_name == "Option":
         val = int(arg_val, 16)
         return {
@@ -1148,7 +1293,7 @@ def store_temp_file(filedata, filename, path=None):
     @param path: optional path for temp directory.
     @return: path to the temporary file.
     """
-    filename = get_filename_from_path(filename)
+    filename = get_filename_from_path(filename).encode("utf-8", "replace")
 
     # Reduce length (100 is arbitrary).
     filename = filename[:100]
@@ -1177,13 +1322,120 @@ def store_temp_file(filedata, filename, path=None):
 
     return tmp_file_path
 
-def demux_sample(filename):
-    """
-    If file is a ZIP, extract its included files and return their file paths
-    """
-    retlist = []
-    retlist.append(filename)
-    return retlist
+def get_vt_consensus(namelist):
+    blacklist = [
+        "other",
+        "troj",
+        "trojan",
+        "win32",
+        "trojandownloader",
+        "trojandropper",
+        "dropper",
+        "generik",
+        "generic",
+        "tsgeneric",
+        "malware",
+        "dldr",
+        "downloader",
+        "injector",
+        "agent",
+        "nsis",
+        "generickd",
+        "behaveslike",
+        "heur",
+        "inject2",
+        "trojanspy",
+        "trojanpws",
+        "reputation",
+        "script",
+        "w97m",
+        "lookslike",
+        "macro",
+        "dloadr",
+        "kryptik",
+        "graftor",
+        "artemis",
+        "zbot",
+        "w2km",
+        "docdl",
+        "variant",
+        "packed",
+        "trojware",
+        "worm",
+        "genetic",
+        "backdoor",
+        "email",
+        "obfuscated",
+        "cryptor",
+        "obfus",
+        "virus",
+        "xpack",
+        "crypt",
+        "rootkit",
+        "malwares",
+        "suspicious",
+        "riskware",
+        "risk",
+        "win64",
+        "troj64",
+        "drop",
+        "hacktool",
+        "exploit",
+        "msil",
+        "inject",
+        "dropped",
+        "program",
+        "unwanted",
+        "heuristic",
+        "patcher",
+        "tool",
+        "potentially",
+        "rogue",
+        "keygen",
+        "unsafe",
+        "application",
+        "risktool",
+        "multi",
+        "ransom",
+        "autoit",
+        "yakes",
+        "java",
+        "ckrf",
+        "html",
+        "bngv",
+        "bnaq",
+        "o97m",
+        "blqi",
+        "bmbg",
+    ]
+
+    finaltoks = defaultdict(int)
+    for name in namelist:
+        toks = re.findall(r"[A-Za-z0-9]+", name)
+        for tok in toks:
+            finaltoks[tok.title()] += 1
+    for tok in finaltoks.keys():
+        lowertok = tok.lower()
+        accepted = True
+        numlist = [x for x in tok if x.isdigit()]
+        if len(numlist) > 2 or len(tok) < 4:
+            accepted = False
+        if accepted:
+            for black in blacklist:
+                if black == lowertok:
+                    accepted = False
+                    break
+        if not accepted:
+            del finaltoks[tok]
+
+    sorted_finaltoks = sorted(finaltoks.items(), key=operator.itemgetter(1), reverse=True)
+    if len(sorted_finaltoks) == 1 and sorted_finaltoks[0][1] >= 2:
+        return sorted_finaltoks[0][0]
+    elif len(sorted_finaltoks) > 1 and (sorted_finaltoks[0][1] >= sorted_finaltoks[1][1] * 2 or sorted_finaltoks[0][1] > 8):
+        return sorted_finaltoks[0][0]
+    elif len(sorted_finaltoks) > 1 and sorted_finaltoks[0][1] == sorted_finaltoks[1][1] and sorted_finaltoks[0][1] > 2:
+        return sorted_finaltoks[0][0]
+    return ""
 
 class TimeoutServer(xmlrpclib.ServerProxy):
     """Timeout server for XMLRPC.
@@ -1298,6 +1550,17 @@ def sanitize_filename(x):
             out += "_"
 
     return out
+
+def default_converter(v):
+    # Fix signed ints (bson is kind of limited there).
+    if type(v) is int:
+        return v & 0xFFFFFFFF
+    elif type(v) is long:
+        if v & 0xFFFFFFFF00000000:
+            return v & 0xFFFFFFFFFFFFFFFF
+        else:
+            return v & 0xFFFFFFFF
+    return v
 
 def classlock(f):
     """Classlock decorator (created for database.Database).
