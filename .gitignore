@@ -41,3 +41,6 @@ modules/feeds/*
 
 shares/
 software/
+
+# Ignore specific configuration files
+conf/
