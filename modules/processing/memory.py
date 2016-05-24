@@ -6,6 +6,8 @@ import os
 import logging
 import time
 
+log = logging.getLogger(__name__)
+
 try:
     import re2 as re
 except ImportError:
@@ -36,10 +38,9 @@ try:
     # re-use the rootlogger level (so if we want to debug, it works for volatility)
     logging.getLogger("volatility.obj").setLevel(rootlogger.level)
     logging.getLogger("volatility.utils").setLevel(rootlogger.level)
-except ImportError:
+except ImportError as e:
+    log.error(e)
     HAVE_VOLATILITY = False
-
-log = logging.getLogger(__name__)
 
 class VolatilityAPI(object):
     """ Volatility API interface."""
