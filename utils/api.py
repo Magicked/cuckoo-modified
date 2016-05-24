@@ -422,6 +422,42 @@ def task_screenshots(task=0, screenshot=None):
     else:
         return HTTPError(404, folder_path)
 
+@route("/memory/list/<task_id:int>")
+def memorydumps_list(task_id):
+    folder_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+
+    if os.path.exists(folder_path):
+        memory_files = []
+        memory_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+        for subdir, dirs, files in os.walk(memory_path):
+            for filename in files:
+                memory_files.append(filename)
+
+        if len(memory_files) == 0:
+            return json_error(404, "Memory dump not found")
+
+        return jsonize({"dump_files": memory_files})
+    else:
+        return HTTPError(404, "Memory dump not found")
+
+@route("/memory/get/<task_id:int>/<pid>")
+def memorydumps_get(task_id, pid=None):
+    folder_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+
+    if os.path.exists(folder_path):
+        if pid:
+            pid_name = "{0}.dmp.zip".format(pid)
+            pid_path = os.path.join(folder_path, pid_name)
+            if os.path.exists(pid_path):
+                response.content_type = "application/zip"
+                return open(pid_path, "rb").read()
+            else:
+                return HTTPError(404, "Memory dump not found in {}".format(pid_path))
+        else:
+            return HTTPError(404, "Memory dump not found")
+    else:
+        return HTTPError(404, "Memory dump not found")
+
 application = default_app()
 
 if __name__ == "__main__":
