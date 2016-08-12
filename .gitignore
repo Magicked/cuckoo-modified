@@ -33,3 +33,14 @@ cuckoo.v12.suo
 # Ignore yara rules
 data/yara/index_*.yar
 UpgradeLog.htm
+
+*.ashland
+
+modules/signatures/*
+modules/feeds/*
+
+shares/
+software/
+
+# Ignore specific configuration files
+conf/

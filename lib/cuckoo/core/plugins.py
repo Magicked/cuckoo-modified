@@ -511,7 +511,7 @@ class RunSignatures(object):
         if not family and self.results["info"]["category"] == "file" and "virustotal" in self.results and "results" in self.results["virustotal"] and self.results["virustotal"]["results"]:
             detectnames = []
             for res in self.results["virustotal"]["results"]:
-                if res["sig"]:
+                if res["sig"] and "Trojan.Heur." not in res["sig"]:
                     # weight Microsoft's detection, they seem to be more accurate than the rest
                     if res["vendor"] == "Microsoft":
                         detectnames.append(res["sig"])
@@ -523,15 +523,14 @@ class RunSignatures(object):
             for alert in self.results["suricata"]["alerts"]:
                 if "signature" in alert and alert["signature"]:
                     if alert["signature"].startswith("ET TROJAN") or alert["signature"].startswith("ETPRO TROJAN"):
-                        words = re.findall(r"[A-Za-z0-9\.]+", alert["signature"])
+                        words = re.findall(r"[A-Za-z0-9]+", alert["signature"])
                         famcheck = words[2]
                         famchecklower = famcheck.lower()
-                        if famchecklower == "win32":
+                        if famchecklower == "win32" or famchecklower == "w32" or famchecklower == "ransomware":
                             famcheck = words[3]
                             famchecklower = famcheck.lower()
 
                         blacklist = [
-                            "upx",
                             "executable",
                             "potential",
                             "likely",
@@ -547,19 +546,26 @@ class RunSignatures(object):
                             "probably",
                             "w2km",
                             "http",
+                            "abuse",
+                            "win32",
+                            "unknown",
+                            "single",
+                            "filename",
                         ]
                         isgood = True
                         for black in blacklist:
                             if black == famchecklower:
                                 isgood = False
                                 break
+                        if len(famcheck) < 4:
+                            isgood = False
                         if isgood:
-                            famcheck = famcheck.split(".")[0]
                             family = famcheck.title()
 
         # fall back to ClamAV detection
         if not family and self.results["info"]["category"] == "file" and "clamav" in self.results["target"]["file"] and self.results["target"]["file"]["clamav"] and self.results["target"]["file"]["clamav"].startswith("Win.Trojan."):
-            family = self.results["target"]["file"]["clamav"][11:]
+            words = re.findall(r"[A-Za-z0-9]+", self.results["target"]["file"]["clamav"])
+            family = words[2]
 
         self.results["malfamily"] = family
 
@@ -667,6 +673,7 @@ class GetFeeds(object):
 
     def __init__(self, results):
         self.results = results
+        self.results["feeds"] = dict()
 
     def process(self, feed):
         """Process modules with either downloaded data directly, or by
@@ -691,7 +698,7 @@ class GetFeeds(object):
             except:
                 log.exception("Failed to run feed \"%s\"", current.name)
                 return
-        self.results["feeds"] = dict()
+
         self.results["feeds"][current.name] = current.get_feedpath()
 
     def run(self):

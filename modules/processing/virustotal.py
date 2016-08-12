@@ -52,7 +52,7 @@ class VirusTotal(Processing):
             if not os.path.exists(self.file_path):
                 raise CuckooProcessingError("File {0} not found, skipping it".format(self.file_path))
 
-            resource = File(self.file_path).get_md5()
+            resource = File(self.file_path).get_sha256()
             url = VIRUSTOTAL_FILE_URL
 
         elif self.task["category"] == "url" and do_url_lookup:
@@ -98,10 +98,16 @@ class VirusTotal(Processing):
         except ValueError as e:
             raise CuckooProcessingError("Unable to convert response to "
                                         "JSON: {0}".format(e))
+
+        # Work around VT brain-damage
+        if isinstance(virustotal, list) and len(virustotal):
+            virustotal = virustotal[0]
+
         if "scans" in virustotal:
             items = virustotal["scans"].items()
             virustotal["scans"] = dict((engine.replace(".", "_"), signature)
                                        for engine, signature in items)
+            virustotal["resource"] = resource
             virustotal["results"]=list(({"vendor":engine.replace(".", "_"),"sig": signature["result"]}) 
                                             for engine, signature in items)
         return virustotal

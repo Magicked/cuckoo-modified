@@ -21,6 +21,7 @@ try:
 except ImportError:
     import re
 
+from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.abstracts import Report
 from lib.cuckoo.common.exceptions import CuckooDependencyError
 from lib.cuckoo.common.exceptions import CuckooReportError
@@ -38,16 +39,26 @@ class ReSubmitExtractedEXE(Report):
         self.task_options_stack = []
         self.task_options = None
         self.task_custom = None
+        self.machine = None
         self.resubcnt = 0
         report = dict(results)
 
         if report["info"].has_key("options") and report["info"]["options"].has_key("resubmitjob") and report["info"]["options"]["resubmitjob"]:
             return
-        else:
-           self.task_options_stack.append("resubmitjob=true")
+
+        # copy all the options from current
+        if "options" in report["info"] and report["info"]["options"]:
+            for key,val in report["info"]["options"].items():
+                self.task_options_stack.append(key + "=" + str(val))
+
+        # copy machine label from current
+        if "machine" in report["info"] and report["info"]["machine"]:
+            self.machine = report["info"]["machine"]["label"]
+
+        self.task_options_stack.append("resubmitjob=true")
         if self.noinject:
             self.task_options_stack.append("free=true")
-         
+
         if self.task_options_stack:
             self.task_options=','.join(self.task_options_stack)
 
@@ -58,8 +69,21 @@ class ReSubmitExtractedEXE(Report):
             if os.path.isfile(dropped["path"]):
                 if ("PE32" in dropped["type"] or "MS-DOS" in dropped["type"]) and "DLL" not in dropped["type"]:
                     if not filesdict.has_key(dropped['sha256']):
-                        filesdict[dropped['sha256']] = dropped['path']
-                        self.resubcnt = self.resubcnt + 1
+                        srcpath = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(report["info"]["id"]), "files", dropped['sha256'])
+                        linkdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(report["info"]["id"]), "files", dropped['sha256'] + "_link")
+                        guest_paths = [line.strip() for line in open(srcpath + "_info.txt")]
+                        guest_name = guest_paths[0].split("\\")[-1]
+                        linkpath = os.path.join(linkdir, guest_name)
+                        if not os.path.exists(linkdir):
+                            os.makedirs(linkdir, mode=0755)
+                        try:
+                            if not os.path.exists(linkpath):
+                                os.symlink(srcpath, linkpath)
+                            filesdict[dropped['sha256']] = linkpath
+                            self.resubcnt += 1
+                        except:
+                            filesdict[dropped['sha256']] = dropped['path']
+                            self.resubcnt += 1
             
         if report.has_key("suricata") and report["suricata"]:
             if report["suricata"].has_key("files") and report["suricata"]["files"]:
@@ -91,13 +115,14 @@ class ReSubmitExtractedEXE(Report):
                                   timeout=200,
                                   options=self.task_options,
                                   priority=1,
-                                  machine=None,
+                                  machine=self.machine,
                                   platform=None,
                                   custom=self.task_custom,
                                   memory=False,
                                   enforce_timeout=False,
                                   clock=None,
-                                  tags=None)
+                                  tags=None,
+                                  parent_id=int(report["info"]["id"]))
 
             if task_id:
                 log.info(u"Resubmitexe file \"{0}\" added as task with ID {1}".format(filesdict[e], task_id))

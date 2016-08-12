@@ -31,6 +31,24 @@ try:
 except ImportError:
     HAVE_CHARDET = False
 
+def validate_referer(url):
+    if not url:
+        return None
+
+    #Django Validator BSD lic. https://github.com/django/django
+    url_re = re.compile(
+        r'^(?:http|ftp)s?://' # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+        r'localhost|' #localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+        r'(?::\d+)?' # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
+    if not url_re.match(url):
+        return None
+
+    return url
+
 def create_folders(root=".", folders=[]):
     """Create directories.
     @param root: root path.
@@ -134,6 +152,19 @@ def sanitize_pathname(s):
         return s
 
     return "".join(convert_filename_char(c) for c in s)
+
+def simple_pretty_print_convert(argval, enumdict):
+    retnames = []
+    leftover = argval
+    for key, value in enumdict.items():
+        if argval & value:
+            leftover &= ~value
+            retnames.append(key)
+
+    if leftover:
+        retnames.append("0x{0:08x}".format(leftover))
+
+    return "|".join(retnames)
 
 def pretty_print_retval(category, api_name, status, retval):
     """Creates pretty-printed versions of an API return value
@@ -245,9 +276,47 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
         if val:
             res.append("0x{0:08x}".format(val))
         return "|".join(res)
+    elif arg_name == "ClsContext":
+        val = int(arg_val, 16)
+        enumdict = {
+            "CLSCTX_INPROC_SERVER"           : 0x1,
+            "CLSCTX_INPROC_HANDLER"          : 0x2,
+            "CLSCTX_LOCAL_SERVER"            : 0x4,
+            "CLSCTX_INPROC_SERVER16"         : 0x8,
+            "CLSCTX_REMOTE_SERVER"           : 0x10,
+            "CLSCTX_INPROC_HANDLER16"        : 0x20,
+            "CLSCTX_NO_CODE_DOWNLOAD"        : 0x400,
+            "CLSCTX_NO_CUSTOM_MARSHAL"       : 0x1000,
+            "CLSCTX_ENABLE_CODE_DOWNLOAD"    : 0x2000,
+            "CLSCTX_NO_FAILURE_LOG"          : 0x4000,
+            "CLSCTX_DISABLE_AAA"             : 0x8000,
+            "CLSCTX_ENABLE_AAA"              : 0x10000,
+            "CLSCTX_FROM_DEFAULT_CONTEXT"    : 0x20000,
+            "CLSCTX_ACTIVATE_32_BIT_SERVER"  : 0x40000,
+            "CLSCTX_ACTIVATE_64_BIT_SERVER"  : 0x80000,
+            "CLSCTX_ENABLE_CLOAKING"         : 0x100000,
+            "CLSCTX_APPCONTAINER"            : 0x400000,
+            "CLSCTX_ACTIVATE_AAA_AS_IU"      : 0x800000,
+            "CLSCTX_PS_DLL"                  : 0x80000000
+        }
+        return simple_pretty_print_convert(val, enumdict)
+    elif arg_name == "BlobType":
+        val = int(arg_val, 10)
+        return {
+                0x0001 : "SIMPLEBLOB",
+                0x0006 : "PUBLICKEYBLOB",
+                0x0007 : "PRIVATEKEYBLOB",
+                0x0008 : "PLAINTEXTKEYBLOB",
+                0x0009 : "OPAQUEKEYBLOB",
+                0x000a : "PUBLICKEYBLOBEX",
+                0x000b : "SYMMETRICWRAPKEYBLOB",
+                0x000c : "KEYSTATEBLOB",
+        }.get(val, None)
     elif arg_name == "Algid":
         val = int(arg_val, 16)
         return {
+                0x0001 : "AT_KEYEXCHANGE",
+                0x0002 : "AT_SIGNATURE",
                 0x8001 : "MD2",
                 0x8002 : "MD4",
                 0x8003 : "MD5",
@@ -386,7 +455,10 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
                 14 : "WH_MOUSE_LL"
         }.get(val, None)
     elif arg_name == "InfoLevel":
-        val = int(arg_val, 10)
+        try:
+            val = int(arg_val, 16)
+        except:
+            val = int(arg_val, 10)
         return {
                 1 : "HTTP_QUERY_CONTENT_TYPE",
                 5 : "HTTP_QUERY_CONTENT_LENGTH",
@@ -751,7 +823,7 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
         if val:
             res.append("0x{0:08x}".format(val))
         return "|".join(res)
-    elif api_name == "MoveFileWithProgressW" and arg_name == "Flags":
+    elif (api_name == "MoveFileWithProgressW" or api_name == "MoveFileWithProgressTransactedW") and arg_name == "Flags":
         val = int(arg_val, 16)
         res = []
         if val & 0x00000001:
@@ -970,6 +1042,9 @@ def pretty_print_arg(category, api_name, arg_name, arg_val):
         if val & 0x1000:
             res.append("PROCESS_QUERY_LIMITED_INFORMATION")
             remove |= 0x1000
+        if val & 0x100000:
+            res.append("SYNCHRONIZE")
+            remove |= 0x100000
         val &= ~remove
         if val:
             res.append("0x{0:08x}".format(val))
@@ -1440,6 +1515,14 @@ def get_vt_consensus(namelist):
         "kazy",
         "x97m",
         "msword",
+        "cozm",
+        "eldorado",
+        "fakems",
+        "cloud",
+        "stealer",
+        "dangerousobject",
+        "symmi",
+        "zusy",
     ]
 
     finaltoks = defaultdict(int)
@@ -1588,7 +1671,9 @@ def default_converter(v):
     # Fix signed ints (bson is kind of limited there).
     if type(v) is int:
         return v & 0xFFFFFFFF
-    elif type(v) is long:
+    # Need to account for subclasses since pymongo's bson module
+    # uses 'bson.int64.Int64' class for 64-bit values.
+    elif issubclass(type(v), long):
         if v & 0xFFFFFFFF00000000:
             return v & 0xFFFFFFFFFFFFFFFF
         else:

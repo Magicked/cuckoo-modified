@@ -14,7 +14,7 @@ import xmlrpclib
 import traceback
 import subprocess
 from ctypes import create_unicode_buffer, create_string_buffer, POINTER
-from ctypes import c_wchar_p, byref, c_int, sizeof, cast, c_void_p, c_ulong
+from ctypes import c_wchar_p, byref, c_int, sizeof, cast, c_void_p, c_ulong, addressof
 from threading import Lock, Thread
 from datetime import datetime, timedelta
 from shutil import copy
@@ -23,13 +23,13 @@ from lib.api.process import Process
 from lib.common.abstracts import Package, Auxiliary
 from lib.common.constants import PATHS, PIPE, SHUTDOWN_MUTEX, TERMINATE_EVENT
 from lib.common.constants import CUCKOOMON32_NAME, CUCKOOMON64_NAME, LOADER32_NAME, LOADER64_NAME
-from lib.common.defines import KERNEL32, NTDLL
+from lib.common.defines import ADVAPI32, KERNEL32, NTDLL
 from lib.common.defines import ERROR_MORE_DATA, ERROR_PIPE_CONNECTED
 from lib.common.defines import PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE
 from lib.common.defines import PIPE_READMODE_MESSAGE, PIPE_WAIT
 from lib.common.defines import PIPE_UNLIMITED_INSTANCES, INVALID_HANDLE_VALUE
 from lib.common.defines import SYSTEM_PROCESS_INFORMATION
-from lib.common.defines import EVENT_MODIFY_STATE
+from lib.common.defines import EVENT_MODIFY_STATE, SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SYSTEMTIME
 from lib.common.exceptions import CuckooError, CuckooPackageError
 from lib.common.hashing import hash_file
 from lib.common.results import upload_to_host
@@ -53,12 +53,26 @@ DEFAULT_DLL = None
 
 SERVICES_PID = None
 MONITORED_SERVICES = False
+MONITORED_WMI = False
+MONITORED_DCOM = False
+MONITORED_TASKSCHED = False
 LASTINJECT_TIME = None
 NUM_INJECTED = 0
 
 PID = os.getpid()
 PPID = Process(pid=PID).get_parent_pid()
 HIDE_PIDS = None
+
+def pid_from_service_name(servicename):
+    sc_handle = ADVAPI32.OpenSCManagerA(None, None, 0x0001)
+    serv_handle = ADVAPI32.OpenServiceA(sc_handle, servicename, 0x0005)
+    buf = create_string_buffer(36)
+    needed = c_int(0)
+    ADVAPI32.QueryServiceStatusEx(serv_handle, 0, buf, sizeof(buf), byref(needed))
+    thepid = struct.unpack("IIIIIIIII", buf.raw)[7]
+    ADVAPI32.CloseServiceHandle(serv_handle)
+    ADVAPI32.CloseServiceHandle(sc_handle)
+    return thepid
 
 def in_protected_path(fname):
     """Checks file name against some protected names."""
@@ -133,9 +147,7 @@ def dump_file(file_path):
         idx = DUMPED_LIST.index(sha256)
         upload_path = UPLOADPATH_LIST[idx]
     else:
-        upload_path = os.path.join("files",
-                               str(random.randint(100000000, 9999999999)),
-                               file_name.encode("utf-8", "replace"))
+        upload_path = os.path.join("files", sha256)
     try:
         upload_to_host(file_path, upload_path, duplicate)
         if not duplicate:
@@ -226,6 +238,9 @@ class PipeHandler(Thread):
         @return: operation status.
         """
         global MONITORED_SERVICES
+        global MONITORED_WMI
+        global MONITORED_DCOM
+        global MONITORED_TASKSCHED
         global LASTINJECT_TIME
         global NUM_INJECTED
         try:
@@ -313,14 +328,96 @@ class PipeHandler(Thread):
                         log.info("Process with pid %s has terminated", pid)
                         PROCESS_LIST.remove(pid)
 
+                elif command.startswith("INTEROP:"):
+                    if not MONITORED_DCOM:
+                        MONITORED_DCOM = True
+                        dcom_pid = pid_from_service_name("DcomLaunch")
+                        if dcom_pid:
+                            servproc = Process(pid=dcom_pid,suspended=False)
+                            servproc.set_critical()
+                            filepath = servproc.get_filepath()
+                            servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                            LASTINJECT_TIME = datetime.now()
+                            servproc.close()
+                            KERNEL32.Sleep(2000)
+
+                elif command.startswith("WMI:"):
+                    if not MONITORED_WMI:
+                        MONITORED_WMI = True
+                        si = subprocess.STARTUPINFO()
+                        # STARTF_USESHOWWINDOW
+                        si.dwFlags = 1
+                        # SW_HIDE
+                        si.wShowWindow = 0
+                        log.info("Stopping WMI Service")
+                        p = subprocess.Popen(['net', 'stop', 'winmgmt'], startupinfo=si, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        dummyvar = p.communicate(input='Y\n')
+                        log.info("Stopped WMI Service")
+                        subprocess.call("sc config winmgmt type= own", startupinfo=si)
+
+                        if not MONITORED_DCOM:
+                            dcom_pid = pid_from_service_name("DcomLaunch")
+                            if dcom_pid:
+                                servproc = Process(pid=dcom_pid,suspended=False)
+                                servproc.set_critical()
+                                filepath = servproc.get_filepath()
+                                servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                                LASTINJECT_TIME = datetime.now()
+                                servproc.close()
+                                KERNEL32.Sleep(2000)
+
+                        log.info("Starting WMI Service")
+                        subprocess.call("net start winmgmt", startupinfo=si)
+                        log.info("Started WMI Service")
+
+                        wmi_pid = pid_from_service_name("winmgmt")
+                        if wmi_pid:
+                            servproc = Process(pid=wmi_pid,suspended=False)
+                            servproc.set_critical()
+                            filepath = servproc.get_filepath()
+                            servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                            LASTINJECT_TIME = datetime.now()
+                            servproc.close()
+                            KERNEL32.Sleep(2000)
+
+                elif command.startswith("TASKSCHED:"):
+                    if not MONITORED_TASKSCHED:
+                        MONITORED_TASKSCHED = True
+                        si = subprocess.STARTUPINFO()
+                        # STARTF_USESHOWWINDOW
+                        si.dwFlags = 1
+                        # SW_HIDE
+                        si.wShowWindow = 0
+                        log.info("Stopping Task Scheduler Service")
+                        p = subprocess.Popen(['net', 'stop', 'schedule'], startupinfo=si, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        dummyvar = p.communicate(input='Y\n')
+                        log.info("Stopped Task Scheduler Service")
+                        subprocess.call("sc config schedule type= own", startupinfo=si)
+
+                        log.info("Starting Task Scheduler Service")
+                        subprocess.call("net start schedule", startupinfo=si)
+                        log.info("Started Task Scheduler Service")
+
+                        sched_pid = pid_from_service_name("schedule")
+                        if sched_pid:
+                            servproc = Process(pid=sched_pid,suspended=False)
+                            servproc.set_critical()
+                            filepath = servproc.get_filepath()
+                            servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                            LASTINJECT_TIME = datetime.now()
+                            servproc.close()
+                            KERNEL32.Sleep(2000)
+
                 # Handle case of a service being started by a monitored process
                 # Switch the service type to own process behind its back so we
                 # can monitor the service more easily with less noise
                 elif command.startswith("SERVICE:"):
                     servname = command[8:]
                     si = subprocess.STARTUPINFO()
-                    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-                    si.wShowWindow = subprocess.SW_HIDE
+                    # STARTF_USESHOWWINDOW
+                    si.dwFlags = 1
+                    # SW_HIDE
+                    si.wShowWindow = 0
                     subprocess.call("sc config " + servname + " type= own", startupinfo=si)
                     log.info("Announced starting service \"%s\"", servname)
 
@@ -330,6 +427,7 @@ class PipeHandler(Thread):
                         # unable to inject
                         if SERVICES_PID:
                             servproc = Process(pid=SERVICES_PID,suspended=False)
+                            servproc.set_critical()
                             filepath = servproc.get_filepath()
                             servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
                             LASTINJECT_TIME = datetime.now()
@@ -348,6 +446,7 @@ class PipeHandler(Thread):
                 # Handle attempted shutdowns/restarts -- flush logs for all monitored processes
                 # additional handling can be added later
                 elif command.startswith("SHUTDOWN:"):
+                    log.info("Received shutdown request")
                     PROCESS_LOCK.acquire()
                     for process_id in PROCESS_LIST:
                         event_name = TERMINATE_EVENT + str(process_id)
@@ -355,6 +454,10 @@ class PipeHandler(Thread):
                         if event_handle:
                             KERNEL32.SetEvent(event_handle)
                             KERNEL32.CloseHandle(event_handle)
+                            if self.options.get("procmemdump"):
+                                p = Process(pid=process_id)
+                                p.dump_memory()
+                            dump_files()
                     PROCESS_LOCK.release()
                 # Handle case of malware terminating a process -- notify the target
                 # ahead of time so that it can flush its log buffer
@@ -447,10 +550,9 @@ class PipeHandler(Thread):
                                 is_64bit = proc.is_64bit()
                                 filename = os.path.basename(filepath)
 
-                                log.info("Announced %s process name: %s pid: %d", "64-bit" if is_64bit else "32-bit", filename, process_id)
-
-                                if not in_protected_path(filename):
-                                    res = proc.inject(dll, interest)
+                                if not in_protected_path(filename) and proc.check_inject():
+                                    log.info("Announced %s process name: %s pid: %d", "64-bit" if is_64bit else "32-bit", filename, process_id)
+                                    proc.inject(dll, interest)
                                     LASTINJECT_TIME = datetime.now()
                                 proc.close()
                         else:
@@ -530,6 +632,14 @@ class PipeServer(Thread):
         try:
             while self.do_run:
                 # Create the Named Pipe.
+                sd = SECURITY_DESCRIPTOR()
+                sa = SECURITY_ATTRIBUTES()
+                ADVAPI32.InitializeSecurityDescriptor(byref(sd), 1)
+                ADVAPI32.SetSecurityDescriptorDacl(byref(sd), True, None, False)
+                sa.nLength = sizeof(SECURITY_ATTRIBUTES)
+                sa.bInheritHandle = False
+                sa.lpSecurityDescriptor = addressof(sd)
+
                 h_pipe = KERNEL32.CreateNamedPipeA(self.pipe_name,
                                                    PIPE_ACCESS_DUPLEX,
                                                    PIPE_TYPE_MESSAGE |
@@ -539,7 +649,7 @@ class PipeServer(Thread):
                                                    BUFSIZE,
                                                    BUFSIZE,
                                                    0,
-                                                   None)
+                                                   byref(sa))
 
                 if h_pipe == INVALID_HANDLE_VALUE:
                     return False
@@ -625,17 +735,21 @@ class Analyzer:
 
         # Set virtual machine clock.
         clock = datetime.strptime(self.config.clock, "%Y%m%dT%H:%M:%S")
-        # Setting date and time.
-        # NOTE: Windows system has only localized commands with date format
-        # following localization settings, so these commands for english date
-        # format cannot work in other localizations.
-        # In addition DATE and TIME commands are blocking if an incorrect
-        # syntax is provided, so an echo trick is used to bypass the input
-        # request and not block analysis.
+
+        systime = SYSTEMTIME()
+        systime.wYear = clock.year
+        systime.wMonth = clock.month
+        systime.wDay = clock.day
+        systime.wHour = clock.hour
+        systime.wMinute = clock.minute
+        systime.wSecond = clock.second
+        systime.wMilliseconds = 0
+
+        KERNEL32.SetSystemTime(byref(systime))
+
         thedate = clock.strftime("%m-%d-%y")
         thetime = clock.strftime("%H:%M:%S")
-        os.system("echo:|date {0}".format(thedate))
-        os.system("echo:|time {0}".format(thetime))
+
         log.info("Date set to: {0}, time set to: {1}".format(thedate, thetime))
 
         # Set the default DLL to be used by the PipeHandler.
@@ -895,11 +1009,12 @@ class Analyzer:
 
         # Create the shutdown mutex.
         KERNEL32.CreateMutexA(None, False, SHUTDOWN_MUTEX)
-
+        log.info("Created shutdown mutex.")
         # since the various processes poll for the existence of the mutex, sleep
         # for a second to ensure they see it before they're terminated
         KERNEL32.Sleep(1000)
 
+        log.info("Shutting down package.")
         try:
             # Before shutting down the analysis, the package can perform some
             # final operations through the finish() function.
@@ -908,6 +1023,7 @@ class Analyzer:
             log.warning("The package \"%s\" finish function raised an "
                         "exception: %s", package_name, e)
 
+        log.info("Stopping auxiliary modules.")
         # Terminate the Auxiliary modules.
         for aux in aux_enabled:
             try:
@@ -945,6 +1061,7 @@ class Analyzer:
                         except:
                             continue
 
+        log.info("Finishing auxiliary modules.")
         # Run the finish callback of every available Auxiliary module.
         for aux in aux_avail:
             try:
@@ -956,6 +1073,7 @@ class Analyzer:
                             "module %s: %s", aux.__class__.__name__, e)
 
         # Let's invoke the completion procedure.
+        log.info("Shutting down pipe server and dumping dropped files.")
         self.complete()
 
         return True

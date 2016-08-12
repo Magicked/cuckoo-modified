@@ -67,6 +67,11 @@ def tasks_create_file():
     custom = request.forms.get("custom", "")
     memory = request.forms.get("memory", False)
     clock = request.forms.get("clock", None)
+    shrike_url = request.forms.get("shrike_url", None)
+    shrike_msg = request.forms.get("shrike_msg", None)
+    shrike_sid = request.forms.get("shrike_sid", None)
+    shrike_refer = request.forms.get("shrike_refer", None)
+
     if memory:
         memory = True
     enforce_timeout = request.forms.get("enforce_timeout", False)
@@ -75,7 +80,8 @@ def tasks_create_file():
 
     temp_file_path = store_temp_file(data.file.read(), data.filename)
     task_ids = db.demux_sample_and_add_to_db(file_path=temp_file_path, package=package, timeout=timeout, options=options, priority=priority,
-                                          machine=machine, platform=platform, custom=custom, memory=memory, enforce_timeout=enforce_timeout, tags=tags, clock=clock)
+                                          machine=machine, platform=platform, custom=custom, memory=memory, enforce_timeout=enforce_timeout, tags=tags, clock=clock,
+                                          shrike_url=shrike_url, shrike_msg=shrike_msg, shrike_sid=shrike_sid, shrike_refer=shrike_refer)
     response["task_ids"] = task_ids
     return jsonize(response)
 
@@ -94,6 +100,11 @@ def tasks_create_url():
     tags = request.forms.get("tags", None)
     custom = request.forms.get("custom", "")
     memory = request.forms.get("memory", False)
+    shrike_url = request.forms.get("shrike_url", None)
+    shrike_msg = request.forms.get("shrike_msg", None)
+    shrike_sid = request.forms.get("shrike_sid", None)
+    shrike_refer = request.forms.get("shrike_refer", None)
+
     if memory:
         memory = True
     enforce_timeout = request.forms.get("enforce_timeout", False)
@@ -113,7 +124,11 @@ def tasks_create_url():
         custom=custom,
         memory=memory,
         enforce_timeout=enforce_timeout,
-        clock=clock
+        clock=clock,
+        shrike_url=shrike_url,
+        shrike_msg=shrike_msg,
+        shrike_sid=shrike_sid,
+        shrike_refer=shrike_refer
     )
 
     response["task_id"] = task_id
@@ -406,6 +421,42 @@ def task_screenshots(task=0, screenshot=None):
             return zip_data.getvalue()
     else:
         return HTTPError(404, folder_path)
+
+@route("/memory/list/<task_id:int>")
+def memorydumps_list(task_id):
+    folder_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+
+    if os.path.exists(folder_path):
+        memory_files = []
+        memory_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+        for subdir, dirs, files in os.walk(memory_path):
+            for filename in files:
+                memory_files.append(filename)
+
+        if len(memory_files) == 0:
+            return json_error(404, "Memory dump not found")
+
+        return jsonize({"dump_files": memory_files})
+    else:
+        return HTTPError(404, "Memory dump not found")
+
+@route("/memory/get/<task_id:int>/<pid>")
+def memorydumps_get(task_id, pid=None):
+    folder_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory")
+
+    if os.path.exists(folder_path):
+        if pid:
+            pid_name = "{0}.dmp.zip".format(pid)
+            pid_path = os.path.join(folder_path, pid_name)
+            if os.path.exists(pid_path):
+                response.content_type = "application/zip"
+                return open(pid_path, "rb").read()
+            else:
+                return HTTPError(404, "Memory dump not found in {}".format(pid_path))
+        else:
+            return HTTPError(404, "Memory dump not found")
+    else:
+        return HTTPError(404, "Memory dump not found")
 
 application = default_app()
 
