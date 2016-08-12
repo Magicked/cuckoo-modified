@@ -1,36 +1,34 @@
 import json
 import os
-import re
 import socket
 import sys
 import tarfile
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 import random
 import tempfile
 import requests
 
-from bson import json_util
-
 from django.conf import settings
 from wsgiref.util import FileWrapper
 from django.http import HttpResponse, StreamingHttpResponse
-from django.shortcuts import render_to_response
+from django.shortcuts import render
 from django.template import RequestContext
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
 from ratelimit.decorators import ratelimit
 from StringIO import StringIO
-from zipfile import ZipFile, ZIP_STORED
 from bson.objectid import ObjectId
+from django.contrib.auth.decorators import login_required
 
 sys.path.append(settings.CUCKOO_PATH)
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
 from lib.cuckoo.common.quarantine import unquarantine
+from lib.cuckoo.common.saztopcap import saz_to_pcap
 from lib.cuckoo.common.utils import store_temp_file, delete_folder
 from lib.cuckoo.common.utils import convert_to_printable, validate_referer
 from lib.cuckoo.core.database import Database, Task
-from lib.cuckoo.core.database import TASK_RUNNING, TASK_REPORTED
+from lib.cuckoo.core.database import TASK_REPORTED
 
 # Config variables
 apiconf = Config("api")
@@ -62,6 +60,16 @@ db = Database()
 rateblock = False
 raterps = None
 raterpm = None
+
+# Conditional decorator for web authentication
+class conditional_login_required(object):
+    def __init__(self, dec, condition):
+        self.decorator = dec
+        self.condition = condition
+    def __call__(self, func):
+        if not self.condition:
+            return func
+        return self.decorator(func)
 
 def force_int(value):
     try:
@@ -123,6 +131,7 @@ def createProcessTreeNode(process):
     return process_node_dict
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request):
     conf = apiconf.get_config()
     parsed = {}
@@ -158,9 +167,8 @@ def index(request):
                 parsed[key]["rps"] = "None"
                 parsed[key]["rpm"] = "None"
 
-    return render_to_response("api/index.html",
-                             {"config": parsed},
-                             context_instance=RequestContext(request))
+    return render(request, "api/index.html",
+                             {"config": parsed})
 
 # Queue up a file for analysis
 if apiconf.filecreate.get("enabled"):
@@ -185,6 +193,7 @@ def tasks_create_file(request):
         resp["error"] = False
         # Parse potential POST options (see submission/views.py)
         quarantine = request.POST.get("quarantine", "")
+        pcap = request.POST.get("pcap", "")
         package = request.POST.get("package", "")
         timeout = force_int(request.POST.get("timeout"))
         priority = force_int(request.POST.get("priority"))
@@ -257,14 +266,34 @@ def tasks_create_file(request):
                             "error_value": "File size exceeds API limit"}
                     return jsonize(resp, response=True)
 
+                
                 tmp_path = store_temp_file(sample.read(), sample.name)
-
+                if pcap:
+                    if sample.name.lower().endswith(".saz"):
+                        saz = saz_to_pcap(tmp_path)
+                        if saz:
+                            try:
+                                os.remove(tmp_path)
+                            except:
+                                pass
+                            path = saz  
+                        else:
+                             resp = {"error": True,
+                                     "error_value": "Failed to convert SAZ to PCAP"}
+                             return jsonize(resp, response=True)
+                    else:
+                        path = tmp_path
+                    task_id = db.add_pcap(file_path=path)
+                    task_ids.append(task_id)
+                    continue 
+            
                 if quarantine:
                     path = unquarantine(tmp_path)
                     try:
                         os.remove(tmp_path)
                     except:
                         pass
+
                 else:
                     path = tmp_path
 
@@ -303,6 +332,23 @@ def tasks_create_file(request):
                 resp["warning"] = ("Multi-file API submissions disabled - "
                                    "Accepting first file")
             tmp_path = store_temp_file(sample.read(), sample.name)
+            if pcap:
+                if sample.name.lower().endswith(".saz"):
+                    saz = saz_to_pcap(tmp_path)
+                    if saz:
+                        path = saz
+                        try:
+                            os.remove(tmp_path)
+                        except:
+                            pass
+                    else:
+                        resp = {"error": True,
+                                "error_value": "Failed to convert PCAP to SAZ"}
+                        return jsonize(resp, response=True)
+                else:
+                    path = tmp_path
+                task_id = db.add_pcap(file_path=path)
+                task_ids.append(task_id)
 
             if quarantine:
                 path = unquarantine(tmp_path)
@@ -314,38 +360,41 @@ def tasks_create_file(request):
                 path = tmp_path
 
             for entry in task_machines:
-                task_ids_new = db.demux_sample_and_add_to_db(file_path=path,
-                                      package=package,
-                                      timeout=timeout,
-                                      priority=priority,
-                                      options=options,
-                                      machine=entry,
-                                      platform=platform,
-                                      tags=tags,
-                                      custom=custom,
-                                      memory=memory,
-                                      enforce_timeout=enforce_timeout,
-                                      clock=clock,
-                                      shrike_url=shrike_url,
-                                      shrike_msg=shrike_msg,
-                                      shrike_sid=shrike_sid,
-                                      shrike_refer=shrike_refer
-                                      )
-                if task_ids_new:
-                    task_ids.extend(task_ids_new)
+                if not pcap:
+                    task_ids_new = db.demux_sample_and_add_to_db(file_path=path,
+                                          package=package,
+                                          timeout=timeout,
+                                          priority=priority,
+                                          options=options,
+                                          machine=entry,
+                                          platform=platform,
+                                          tags=tags,
+                                          custom=custom,
+                                          memory=memory,
+                                          enforce_timeout=enforce_timeout,
+                                          clock=clock,
+                                          shrike_url=shrike_url,
+                                          shrike_msg=shrike_msg,
+                                          shrike_sid=shrike_sid,
+                                          shrike_refer=shrike_refer
+                                          )
+                    if task_ids_new:
+                        task_ids.extend(task_ids_new)
 
         if len(task_ids) > 0:
-            resp["task_ids"] = task_ids
+            resp["data"] = {}
+            resp["data"]["task_ids"] = task_ids
             callback = apiconf.filecreate.get("status")
             if len(task_ids) == 1:
-                resp["data"] = "Task ID {0} has been submitted".format(
+                resp["data"]["message"] = "Task ID {0} has been submitted".format(
                                str(task_ids[0]))
                 if callback:
                     resp["url"] = ["{0}/submit/status/{1}/".format(
                                   apiconf.api.get("url"), task_ids[0])]
             else:
-                resp["task_ids"] = task_ids
-                resp["data"] = "Task IDs {0} have been submitted".format(
+                resp["data"] = {}
+                resp["data"]["task_ids"] = task_ids
+                resp["data"]["message"] = "Task IDs {0} have been submitted".format(
                                ", ".join(str(x) for x in task_ids))
                 if callback:
                     resp["url"] = list()
@@ -374,6 +423,7 @@ def tasks_create_url(request):
             resp = {"error": True, "error_value": "URL Create API is Disabled"}
             return jsonize(resp, response=True)
 
+        resp["error"] = False
         url = request.POST.get("url", None)
         package = request.POST.get("package", "")
         timeout = force_int(request.POST.get("timeout"))
@@ -475,8 +525,9 @@ def tasks_create_url(request):
                     task_ids.append(task_id)
                  
         if len(task_ids):
-            resp["task_ids"] = task_ids
-            resp["data"] = "Task ID {0} has been submitted".format(
+            resp["data"] = {}
+            resp["data"]["task_ids"] = task_ids
+            resp["data"]["message"] = "Task ID {0} has been submitted".format(
                            str(task_ids[0]))
             if apiconf.urlcreate.get("status"):
                 resp["url"] = ["{0}/submit/status/{1}".format(
@@ -606,17 +657,18 @@ def tasks_vtdl(request):
                 return jsonize(resp, response=True)
          
         if len(task_ids) > 0:
-            resp["task_ids"] = task_ids
+            resp["data"] = {}
+            resp["data"]["task_ids"] = task_ids
             callback = apiconf.filecreate.get("status")
             if len(task_ids) == 1:
-                resp["data"] = "Task ID {0} has been submitted".format(
+                resp["data"]["message"] = "Task ID {0} has been submitted".format(
                                str(task_ids[0]))
                 if callback:
                     resp["url"] = ["{0}/submit/status/{1}/".format(
                                   apiconf.api.get("url"), task_ids[0])]
             else:
-                resp["task_ids"] = task_ids
-                resp["data"] = "Task IDs {0} have been submitted".format(
+                resp["data"]["task_ids"] = task_ids
+                resp["data"]["message"] = "Task IDs {0} have been submitted".format(
                                ", ".join(str(x) for x in task_ids))
                 if callback:
                     resp["url"] = list()
@@ -632,7 +684,7 @@ def tasks_vtdl(request):
 
     return jsonize(resp, response=True)
 
-# Return Sample inforation.
+# Return Sample information.
 if apiconf.fileview.get("enabled"):
     raterps = apiconf.fileview.get("rps", None)
     raterpm = apiconf.fileview.get("rpm", None)
@@ -683,7 +735,7 @@ def files_view(request, md5=None, sha1=None, sha256=None, sample_id=None):
         if sample:
             resp["data"] = sample.to_dict()
         else:
-            resp["data"] = "Sample not found in database"
+            resp = {"error": True, "error_value": "Sample not found in database"}
 
     return jsonize(resp, response=True)
 
@@ -738,7 +790,7 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
                 buf["target"] = buf["target"].split("/")[-1]
                 resp["data"].append(buf)
         else:
-            resp["data"] = "Sample not found in database"
+            resp = {"data": [], "error": False}
 
     return jsonize(resp, response=True)
 
@@ -953,7 +1005,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
 
     completed_after = request.GET.get("completed_after")
     if completed_after:
-        completed_after = fromtimestamp(int(completed_after))
+        completed_after = datetime.fromtimestamp(int(completed_after))
 
     if not completed_after and window:
         maxwindow = apiconf.tasklist.get("maxwindow")
@@ -975,7 +1027,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
     for row in db.list_tasks(limit=limit, details=True, offset=offset,
                              completed_after=completed_after,
                              status=status,
-                             order_by="tasks_completed_on desc"):
+                             order_by=Task.completed_on.desc()):
         resp["buf"] += 1
         task = row.to_dict()
         task["guest"] = {}
@@ -1034,7 +1086,7 @@ def tasks_view(request, task_id):
 
         resp["data"] = entry
     else:
-        resp = {"data": "Task not found in Database"}
+        resp = {"error": True, "error_value": "Task not found in database"}
 
     return jsonize(resp, response=True)
 
@@ -1161,6 +1213,8 @@ def tasks_report(request, task_id, report_format="json"):
     formats = {
         "json": "report.json",
         "html": "report.html",
+        "htmlsummary": "summary-report.html",
+        "pdf": "report.pdf",
         "maec": "report.maec-4.1.xml",
         "metadata": "report.metadata.xml",
     }
@@ -1173,12 +1227,15 @@ def tasks_report(request, task_id, report_format="json"):
             if report_format == "json":
                 content = "application/json; charset=UTF-8"
                 ext = "json"
-            elif report_format == "html":
+            elif report_format.startswith("html"):
                 content = "text/html"
                 ext = "html"
             elif report_format == "maec" or report_format == "metadata":
                 content = "text/xml"
                 ext = "xml"
+            elif export_format == "pdf":
+                content = "application/pdf"
+                ext = "pdf"
             fname = "%s_report.%s" % (task_id, ext)
             with open(report_path, "rb") as report_data:
                 data = report_data.read()
@@ -1249,6 +1306,9 @@ def tasks_iocs(request, task_id, detail=None):
             buf = tmp[-1]["_source"]
         else:
             buf = None
+    if buf is None:
+        resp = {"error": True, "error_value": "Sample not found in database"}
+        return jsonize(resp, response=True)
     if repconf.jsondump.get("enabled") and not buf:
         jfile = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                              "%s" % task_id, "reports", "report.json")
@@ -1260,10 +1320,7 @@ def tasks_iocs(request, task_id, detail=None):
         return jsonize(resp, response=True)
 
     data = {}
-    if buf["malfamily"]:
-        data["malfamily"] = buf["malfamily"]
-    else:
-        data["malfamily"] = "None Identified"
+    data["malfamily"] = buf["malfamily"]
     data["malscore"] = buf["malscore"]
     data["info"] = buf["info"]
     del data["info"]["custom"]
@@ -1778,11 +1835,11 @@ def tasks_fullmemory(request, task_id):
     if check["error"]:
         return jsonize(check, response=True)
 
-    file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), "memory.dmp")
+    file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory.dmp")
     if os.path.exists(file_path):
         filename = os.path.basename(file_path)
     else:
-        file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), "memory.dmp.zip")
+        file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory.dmp.zip")
         if os.path.exists(file_path):
             filename = os.path.basename(file_path)
     if filename:

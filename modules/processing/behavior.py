@@ -51,10 +51,6 @@ class ParseProcessLog(list):
         self.conversion_cache = {}
         self.cfg = Config()
         self.api_limit = self.cfg.processing.analysis_call_limit  # Limit of API calls per process
-        self.spam_apis = []
-        self.spam_apis_whitelist = {
-            "c:\\windows\\system32\\wbem\\wmiprvse.exe": ["GetSystemTimeAsFileTime"],
-        }
 
         if os.path.exists(log_path) and os.stat(log_path).st_size > 0:
             self.parse_first_and_reset()
@@ -337,21 +333,6 @@ class ParseProcessLog(list):
 
         call["arguments"] = arguments
         call["repeated"] = repeated
-        if repeated >= 10000:
-            add_repeat = True
-            if self.module_path.lower() in self.spam_apis_whitelist:
-                if api_name in self.spam_apis_whitelist[self.module_path.lower()]:
-                    add_repeat = False
-
-            if add_repeat:
-                repeat = {
-                    "pid": self.process_id,
-                    "name": self.process_name,
-                    "api": api_name,
-                    "count": repeated
-                }
-                if repeat not in self.spam_apis:
-                    self.spam_apis.append(repeat)
 
         # add the thread id to our thread set
         if call["thread_id"] not in self.threads:
@@ -394,24 +375,10 @@ class Processes:
                 log.warning("Behavioral log {0} too big to be processed, skipped.".format(file_name))
                 continue
 
-            # Invoke parsing of current log file.
+            # Invoke parsing of current log file (if ram_boost is enabled, otherwise parsing is done on-demand)
             current_log = ParseProcessLog(file_path)
             if current_log.process_id is None:
                 continue
-
-            # If we have a spammy API, theres a chance that process did it multiple times
-            # so we'll sum the total counts here as we now have all of the logs parsed for
-            # the specific process
-            if current_log.spam_apis:
-                new_spam_apis = list()
-                # Group by pid+api to sum the counts
-                for _, spams in itertools.groupby(current_log.spam_apis, key=lambda d:
-                                                  (d["pid"], d["api"])):
-                    spams = list(spams)
-                    new_spams = spams[0]
-                    new_spams["count"] = sum(spam["count"] for spam in spams)
-                    new_spam_apis.append(new_spams)
-                current_log.spam_apis = new_spam_apis
 
             # If the current log actually contains any data, add its data to
             # the results list.
@@ -424,7 +391,6 @@ class Processes:
                 "calls": current_log.calls,
                 "threads" : current_log.threads,
                 "environ" : current_log.environdict,
-                "spam_apis": current_log.spam_apis,
             })
 
         # Sort the items in the results list chronologically. In this way we
@@ -562,7 +528,7 @@ class Summary:
             if servicename and servicename not in self.created_services:
                 self.created_services.append(servicename)
 
-        elif call["api"] == "CreateProcessInternalW" or call["api"] == "NtCreateUserProcess":
+        elif call["api"] in ["CreateProcessInternalW", "NtCreateUserProcess", "CreateProcessWithTokenW", "CreateProcessWithLogonW"]:
             cmdline = self.get_argument(call, "CommandLine", strip=True)
             appname = self.get_argument(call, "ApplicationName", strip=True)
             if appname and cmdline:
@@ -834,6 +800,8 @@ class Enhanced(object):
                 "object": "file",
                 "apis": [
                     "CreateProcessInternalW",
+                    "CreateProcessWithLogonW",
+                    "CreateProcessWithTokenW",
                 ],
                 "args": [("file", "CommandLine")]
             },
@@ -1103,7 +1071,8 @@ class ProcessTree:
             parent_id=process["parent_id"],
             module_path=process["module_path"],
             children=[],
-            threads=process["threads"]
+            threads=process["threads"],
+            environ=process["environ"],
         ))
 
     def run(self):
@@ -1169,9 +1138,5 @@ class BehaviorAnalysis(Processing):
                 behavior[instance.key] = instance.run()
             except:
                 log.exception("Failed to run partial behavior class \"%s\"", instance.key)
-
-            # Reset the ParseProcessLog instances after each module
-            for process in behavior["processes"]:
-                process["calls"].reset()
 
         return behavior

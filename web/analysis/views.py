@@ -17,17 +17,17 @@ import tempfile
 
 from django.conf import settings
 from wsgiref.util import FileWrapper
-from django.template import RequestContext
 from django.http import HttpResponse, StreamingHttpResponse
-from django.shortcuts import redirect, render_to_response
+from django.shortcuts import redirect, render
 from django.views.decorators.http import require_safe
 from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.decorators import login_required
 
 from django.core.exceptions import PermissionDenied
 from urllib import quote
 sys.path.append(settings.CUCKOO_PATH)
 
-from lib.cuckoo.core.database import Database, TASK_PENDING
+from lib.cuckoo.core.database import Database, Task, TASK_PENDING
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 import modules.processing.network as network
@@ -63,6 +63,17 @@ if enabledconf["elasticsearchdb"]:
 
 maxsimilar = int(Config("reporting").malheur.maxsimilar)
 
+# Conditional decorator for web authentication
+class conditional_login_required(object):
+    def __init__(self, dec, condition):
+        self.decorator = dec
+        self.condition = condition
+    def __call__(self, func):
+        if not self.condition:
+            return func
+        return self.decorator(func)
+
+
 def get_analysis_info(db, id=-1, task=None):
     if not task:
         task = db.view_task(id)
@@ -70,7 +81,7 @@ def get_analysis_info(db, id=-1, task=None):
         return None
 
     new = task.to_dict()
-    if new["category"] == "file":
+    if new["category"] in ["file", "pcap"] and new["sample_id"] != None:
         new["sample"] = db.view_sample(new["sample_id"]).to_dict()
         filename = os.path.basename(new["target"])
         new.update({"filename": filename})
@@ -80,7 +91,7 @@ def get_analysis_info(db, id=-1, task=None):
                    {"info.id": int(new["id"])},
                    {
                        "info": 1, "virustotal_summary": 1,
-                       "info.custom":1, "info.shrike_msg":1, "malscore": 1, "malfamily": 1, 
+                       "info.custom":1, "info.shrike_msg":1, "malscore": 1, "malfamily": 1,
                        "network.pcap_sha256": 1,
                        "mlist_cnt": 1, "f_mlist_cnt": 1, "info.package": 1, "target.file.clamav": 1,
                        "suri_tls_cnt": 1, "suri_alert_cnt": 1, "suri_http_cnt": 1, "suri_file_cnt": 1
@@ -134,7 +145,7 @@ def get_analysis_info(db, id=-1, task=None):
         if rtmp.has_key("info") and rtmp["info"].has_key("package") and rtmp["info"]["package"]:
             new["package"] = rtmp["info"]["package"]
         if rtmp.has_key("target") and rtmp["target"].has_key("file") and rtmp["target"]["file"].has_key("clamav"):
-            new["clamav"] = rtmp["target"]["file"]["clamav"] 
+            new["clamav"] = rtmp["target"]["file"]["clamav"]
 
         if "display_shrike" in enabledconf and enabledconf["display_shrike"] and rtmp.has_key("info") and rtmp["info"].has_key("shrike_msg") and rtmp["info"]["shrike_msg"]:
             new["shrike_msg"] = rtmp["info"]["shrike_msg"]
@@ -147,6 +158,7 @@ def get_analysis_info(db, id=-1, task=None):
     return new
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request, page=1):
     page = int(page)
     db = Database()
@@ -156,22 +168,28 @@ def index(request, page=1):
 
     tasks_files = db.list_tasks(limit=TASK_LIMIT, offset=off, category="file", not_status=TASK_PENDING)
     tasks_urls = db.list_tasks(limit=TASK_LIMIT, offset=off, category="url", not_status=TASK_PENDING)
+    tasks_pcaps = db.list_tasks(limit=TASK_LIMIT, offset=off, category="pcap", not_status=TASK_PENDING)
     analyses_files = []
     analyses_urls = []
+    analyses_pcaps = []
 
     # Vars to define when to show Next/Previous buttons
     paging = dict()
     paging["show_file_next"] = "show"
     paging["show_url_next"] = "show"
+    paging["show_pcap_next"] = "show"
     paging["next_page"] = str(page + 1)
     paging["prev_page"] = str(page - 1)
 
     tasks_files_number = db.count_matching_tasks(category="file", not_status=TASK_PENDING)
     tasks_urls_number = db.count_matching_tasks(category="url", not_status=TASK_PENDING)
+    tasks_pcaps_number = db.count_matching_tasks(category="pcap", not_status=TASK_PENDING)
     pages_files_num = tasks_files_number / TASK_LIMIT + 1
     pages_urls_num = tasks_urls_number / TASK_LIMIT + 1
+    pages_pcaps_num = tasks_pcaps_number / TASK_LIMIT + 1
     files_pages = []
     urls_pages = []
+    pcaps_pages = []
     if pages_files_num < 11 or page < 6:
         files_pages = range(1, min(10, pages_files_num)+1)
     elif page > 5:
@@ -180,20 +198,30 @@ def index(request, page=1):
         urls_pages = range(1, min(10, pages_urls_num)+1)
     elif page > 5:
         urls_pages = range(min(page-5, pages_urls_num-10)+1, min(page + 5, pages_urls_num)+1)
+    if pages_pcaps_num < 11 or page < 6:
+        pcaps_pages = range(1, min(10, pages_pcaps_num)+1)
+    elif page > 5:
+        pcaps_pages = range(min(page-5, pages_pcaps_num-10)+1, min(page + 5, pages_pcaps_num)+1)
 
     # On a fresh install, we need handle where there are 0 tasks.
-    buf = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by="added_on asc")
+    buf = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc())
     if len(buf) == 1:
-        first_file = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by="added_on asc")[0].to_dict()["id"]
+        first_file = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()["id"]
         paging["show_file_prev"] = "show"
     else:
         paging["show_file_prev"] = "hide"
-    buf = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by="added_on asc")
+    buf = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc())
     if len(buf) == 1:
-        first_url = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by="added_on asc")[0].to_dict()["id"]
+        first_url = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()["id"]
         paging["show_url_prev"] = "show"
     else:
         paging["show_url_prev"] = "hide"
+    buf = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc())
+    if len(buf) == 1:
+        first_pcap = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()["id"]
+        paging["show_pcap_prev"] = "show"
+    else:
+        paging["show_pcap_prev"] = "hide"
 
     if tasks_files:
         for task in tasks_files:
@@ -225,15 +253,31 @@ def index(request, page=1):
     else:
         paging["show_url_next"] = "hide"
 
+    if tasks_pcaps:
+        for task in tasks_pcaps:
+            new = get_analysis_info(db, task=task)
+            if new["id"] == first_pcap:
+                paging["show_pcap_next"] = "hide"
+            if page <= 1:
+                paging["show_pcap_prev"] = "hide"
+
+            if db.view_errors(task.id):
+                new["errors"] = True
+
+            analyses_pcaps.append(new)
+    else:
+        paging["show_pcap_next"] = "hide"
+
     paging["files_page_range"] = files_pages
     paging["urls_page_range"] = urls_pages
+    paging["pcaps_page_range"] = pcaps_pages
     paging["current_page"] = page
-    return render_to_response("analysis/index.html",
-            {"files": analyses_files, "urls": analyses_urls,
-             "paging": paging, "config": enabledconf},
-            context_instance=RequestContext(request))
+    return render(request, "analysis/index.html",
+            {"files": analyses_files, "urls": analyses_urls, "pcaps": analyses_pcaps,
+             "paging": paging, "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def pending(request):
     db = Database()
     tasks = db.list_tasks(status=TASK_PENDING)
@@ -242,11 +286,11 @@ def pending(request):
     for task in tasks:
         pending.append(task.to_dict())
 
-    return render_to_response("analysis/pending.html",
-                              {"tasks": pending},
-                              context_instance=RequestContext(request))
+    return render(request, "analysis/pending.html",
+                              {"tasks": pending})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def chunk(request, task_id, pid, pagenum):
     try:
         pid, pagenum = int(pid), int(pagenum)-1
@@ -299,14 +343,14 @@ def chunk(request, task_id, pid, pagenum):
         else:
             chunk = dict(calls=[])
 
-        return render_to_response("analysis/behavior/_chunk.html",
-                                  {"chunk": chunk},
-                                  context_instance=RequestContext(request))
+        return render(request, "analysis/behavior/_chunk.html",
+                                  {"chunk": chunk})
     else:
         raise PermissionDenied
 
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def filtered_chunk(request, task_id, pid, category, apilist):
     """Filters calls for call category.
     @param task_id: cuckoo task id
@@ -378,9 +422,8 @@ def filtered_chunk(request, task_id, pid, category, apilist):
                     else:
                         filtered_process["calls"].append(call)
 
-        return render_to_response("analysis/behavior/_chunk.html",
-                                  {"chunk": filtered_process},
-                                  context_instance=RequestContext(request))
+        return render(request, "analysis/behavior/_chunk.html",
+                                  {"chunk": filtered_process})
     else:
         raise PermissionDenied
 
@@ -468,15 +511,15 @@ def gen_moloch_from_antivirus(virustotal):
         for key in virustotal["scans"]:
             if virustotal["scans"][key]["result"]:
                  virustotal["scans"][key]["moloch"] = settings.MOLOCH_BASE + "?date=-1&expression=" + quote("tags\x3d\x3d\x22VT:%s:%s\x22" % (key,virustotal["scans"][key]["result"]),safe='')
-    return virustotal 
+    return virustotal
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def surialert(request,task_id):
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.alerts": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
     suricata = report["suricata"]
 
@@ -486,30 +529,28 @@ def surialert(request,task_id):
 
         suricata = gen_moloch_from_suri_alerts(suricata)
 
-    return render_to_response("analysis/surialert.html",
+    return render(request, "analysis/surialert.html",
                               {"analysis": report,
-                               "config": enabledconf},
-                              context_instance=RequestContext(request))
+                               "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def shrike(request,task_id):
     shrike = results_db.analysis.find_one({"info.id": int(task_id)},{"info.shrike_url": 1,"info.shrike_msg": 1,"info.shrike_sid":1, "info.shrike_refer":1},sort=[("_id", pymongo.DESCENDING)])
     if not shrike:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
-    return render_to_response("analysis/shrike.html",
-                              {"shrike": shrike},
-                              context_instance=RequestContext(request))
+    return render(request, "analysis/shrike.html",
+                              {"shrike": shrike})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def surihttp(request,task_id):
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.http": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
     suricata = report["suricata"]
 
@@ -519,18 +560,17 @@ def surihttp(request,task_id):
 
         suricata = gen_moloch_from_suri_http(suricata)
 
-    return render_to_response("analysis/surihttp.html",
+    return render(request, "analysis/surihttp.html",
                               {"analysis": report,
-                               "config": enabledconf},
-                              context_instance=RequestContext(request))
+                               "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def suritls(request,task_id):
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.tls": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
     suricata = report["suricata"]
 
@@ -540,18 +580,17 @@ def suritls(request,task_id):
 
         suricata = gen_moloch_from_suri_tls(suricata)
 
-    return render_to_response("analysis/suritls.html",
+    return render(request, "analysis/suritls.html",
                               {"analysis": report,
-                               "config": enabledconf},
-                              context_instance=RequestContext(request))
+                               "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def surifiles(request,task_id):
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.files": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
     suricata = report["suricata"]
 
@@ -561,29 +600,28 @@ def surifiles(request,task_id):
 
         suricata = gen_moloch_from_suri_file_info(suricata)
 
-    return render_to_response("analysis/surifiles.html",
+    return render(request, "analysis/surifiles.html",
                               {"analysis": report,
-                               "config": enabledconf},
-                              context_instance=RequestContext(request))
+                               "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def antivirus(request,task_id):
     rtmp = results_db.analysis.find_one({"info.id": int(task_id)},{"virustotal": 1,"info.category": 1},sort=[("_id", pymongo.DESCENDING)])
     if not rtmp:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
     if settings.MOLOCH_ENABLED:
         if settings.MOLOCH_BASE[-1] != "/":
             settings.MOLOCH_BASE = settings.MOLOCH_BASE + "/"
         if rtmp.has_key("virustotal"):
             rtmp["virustotal"]=gen_moloch_from_antivirus(rtmp["virustotal"])
 
-    return render_to_response("analysis/antivirus.html",
-                              {"analysis": rtmp},
-                              context_instance=RequestContext(request))
+    return render(request, "analysis/antivirus.html",
+                              {"analysis": rtmp})
 
 @csrf_exempt
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def search_behavior(request, task_id):
     if request.method == 'POST':
         query = request.POST.get('search')
@@ -663,13 +701,13 @@ def search_behavior(request, task_id):
                     'signs': process_results
                 })
 
-        return render_to_response("analysis/behavior/_search_results.html",
-                                  {"results": results},
-                                  context_instance=RequestContext(request))
+        return render(request, "analysis/behavior/_search_results.html",
+                                  {"results": results})
     else:
         raise PermissionDenied
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def report(request, task_id):
     db = Database()
     if enabledconf["mongodb"]:
@@ -688,9 +726,8 @@ def report(request, task_id):
         esdata = {"index": query["_index"], "id": query["_id"]}
         report["es"] = esdata
     if not report:
-        return render_to_response("error.html",
-                                  {"error": "The specified analysis does not exist"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "The specified analysis does not exist"})
 
     if settings.MOLOCH_ENABLED and "suricata" in report:
         suricata = report["suricata"]
@@ -754,16 +791,16 @@ def report(request, task_id):
         except:
             pass
 
-    return render_to_response("analysis/report.html",
+    return render(request, "analysis/report.html",
                              {"analysis": report,
                               "domainlookups": domainlookups,
                               "iplookups": iplookups,
                               "similar": similarinfo,
                               "settings": settings,
-                              "config": enabledconf},
-                             context_instance=RequestContext(request))
+                              "config": enabledconf})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def file(request, category, task_id, dlfile):
     file_name = dlfile
     cd = ""
@@ -788,6 +825,11 @@ def file(request, category, task_id, dlfile):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                             task_id, "shots", file_name)
         cd = "image/jpeg"
+    elif category == "usage":
+        path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                            task_id, "aux", "usage.svg")
+        file_name = "usage.svg"
+        cd = "image/svg+xml"
     elif category in extmap:
         file_name += extmap[category]
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
@@ -821,9 +863,8 @@ def file(request, category, task_id, dlfile):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                             task_id, "logs", "files", file_name)
     else:
-        return render_to_response("error.html",
-                                  {"error": "Category not defined"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "Category not defined"})
 
     if not cd:
         cd = "application/octet-stream"
@@ -832,15 +873,15 @@ def file(request, category, task_id, dlfile):
         resp = StreamingHttpResponse(FileWrapper(open(path), 8192),
                                      content_type=cd)
     except:
-        return render_to_response("error.html",
-                                  {"error": "File not found"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "File not found"})
 
     resp["Content-Length"] = os.path.getsize(path)
     resp["Content-Disposition"] = "attachment; filename=" + file_name
     return resp
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def procdump(request, task_id, process_id, start, end):
     origname = process_id + ".dmp"
     tmpdir = None
@@ -860,9 +901,8 @@ def procdump(request, task_id, process_id, start, end):
     if not os.path.exists(dumpfile):
         dumpfile += ".zip"
         if not os.path.exists(dumpfile):
-            return render_to_response("error.html",
-                                        {"error": "File not found"},
-                                        context_instance=RequestContext(request))
+            return render(request, "error.html",
+                                        {"error": "File not found"})
         f = zipfile.ZipFile(dumpfile, "r")
         tmpdir = tempfile.mkdtemp(prefix="cuckooprocdump_", dir=settings.TEMP_PATH)
         tmp_file_path = f.extract(origname, path=tmpdir)
@@ -903,11 +943,11 @@ def procdump(request, task_id, process_id, start, end):
     if response:
         return response
 
-    return render_to_response("error.html",
-                                  {"error": "File not found"},
-                                  context_instance=RequestContext(request))
+    return render(request, "error.html",
+                                  {"error": "File not found"})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def filereport(request, task_id, category):
     formats = {
         "json": "report.json",
@@ -916,6 +956,7 @@ def filereport(request, task_id, category):
         "pdf": "report.pdf",
         "maec": "report.maec-4.1.xml",
         "metadata": "report.metadata.xml",
+        "misp": "misp.json"
     }
 
     if category in formats:
@@ -929,11 +970,11 @@ def filereport(request, task_id, category):
 
             return response
 
-    return render_to_response("error.html",
-                              {"error": "File not found"},
-                              context_instance=RequestContext(request))
+    return render(request, "error.html",
+                              {"error": "File not found"})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def full_memory_dump_file(request, analysis_number):
     file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), "memory.dmp")
     if os.path.exists(file_path):
@@ -950,12 +991,13 @@ def full_memory_dump_file(request, analysis_number):
         response['Content-Disposition'] = "attachment; filename=%s" % filename
         return response
     else:
-        return render_to_response("error.html",
-                                  {"error": "File not found"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "File not found"})
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def full_memory_dump_strings(request, analysis_number):
     file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), "memory.dmp.strings")
+    filename = None
     if os.path.exists(file_path):
         filename = os.path.basename(file_path)
     else:
@@ -970,9 +1012,8 @@ def full_memory_dump_strings(request, analysis_number):
         response['Content-Disposition'] = "attachment; filename=%s" % filename
         return response
     else:
-        return render_to_response("error.html",
-                                  {"error": "File not found"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "File not found"})
 
 def perform_search(term, value):
     term_map = {
@@ -997,14 +1038,14 @@ def perform_search(term, value):
         "imphash" : "static.pe.imphash",
         "surihttp" : "suricata.http",
         "suritls" : "suricata.tls",
-        "surisid" : "suricata.alerts.signature_id",
+        "surisid" : "suricata.alerts.sid",
         "surialert" : "suricata.alerts.signature",
         "surimsg" : "suricata.alerts.signature",
-        "suriurl" : "suricata.http.url",
-        "suriua" : "suricata.http.http_user_agent",
-        "surireferer" : "suricata.http.http_refer",
+        "suriurl" : "suricata.http.uri",
+        "suriua" : "suricata.http.ua",
+        "surireferer" : "suricata.http.referrer",
         "suritlssubject" : "suricata.tls.subject",
-        "suritlsissuerdn" : "suricata.tls.issuerdn",
+        "suritlsissuerdn" : "suricata.tls.issuer",
         "suritlsfingerprint" : "suricata.tls.fingerprint",
         "clamav" : "target.file.clamav",
         "yaraname" : "target.file.yara.name",
@@ -1023,6 +1064,11 @@ def perform_search(term, value):
     }
 
     query_val =  { "$regex" : value, "$options" : "-i"}
+    if term == "surisid":
+        try:
+            query_val = int(value)
+        except:
+            pass
     if not term:
         value = value.lower()
         query_val = value
@@ -1047,7 +1093,8 @@ def perform_malscore_search(value):
     query_val =  {"$gte" : float(value)}
     if enabledconf["mongodb"]:
         return results_db.analysis.find({"malscore" : query_val}).sort([["_id", -1]])
-        
+
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def search(request):
     if "search" in request.POST:
         error = None
@@ -1061,11 +1108,10 @@ def search(request):
         if term:
             # Check on search size. But malscore can be a single digit number.
             if term != "malscore" and len(value) < 3:
-                return render_to_response("analysis/search.html",
+                return render(request, "analysis/search.html",
                                           {"analyses": None,
                                            "term": request.POST["search"],
-                                           "error": "Search term too short, minimum 3 characters required"},
-                                          context_instance=RequestContext(request))
+                                           "error": "Search term too short, minimum 3 characters required"})
             # name:foo or name: foo
             value = value.lstrip()
             term = term.lower()
@@ -1077,17 +1123,15 @@ def search(request):
                 records = perform_search(term, value)
         except ValueError:
             if term:
-                return render_to_response("analysis/search.html",
+                return render(request, "analysis/search.html",
                                           {"analyses": None,
                                            "term": request.POST["search"],
-                                           "error": "Invalid search term: %s" % term},
-                                          context_instance=RequestContext(request))
+                                           "error": "Invalid search term: %s" % term})
             else:
-                return render_to_response("analysis/search.html",
+                return render(request, "analysis/search.html",
                                           {"analyses": None,
                                            "term": None,
-                                           "error": "Unable to recognize the search syntax"},
-                                          context_instance=RequestContext(request))
+                                           "error": "Unable to recognize the search syntax"})
 
         # Get data from cuckoo db.
         db = Database()
@@ -1101,20 +1145,19 @@ def search(request):
             if not new:
                 continue
             analyses.append(new)
-        return render_to_response("analysis/search.html",
+        return render(request, "analysis/search.html",
                                   {"analyses": analyses,
                                    "config": enabledconf,
                                    "term": request.POST["search"],
-                                   "error": None},
-                                  context_instance=RequestContext(request))
+                                   "error": None})
     else:
-        return render_to_response("analysis/search.html",
+        return render(request, "analysis/search.html",
                                   {"analyses": None,
                                    "term": None,
-                                   "error": None},
-                                  context_instance=RequestContext(request))
+                                   "error": None})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def remove(request, task_id):
     """Remove an analysis.
     @todo: remove folder from storage.
@@ -1137,9 +1180,8 @@ def remove(request, task_id):
                 # Delete analysis data.
                 results_db.analysis.remove({"_id": ObjectId(analysis["_id"])})
         else:
-            return render_to_response("error.html",
-                                      {"error": "The specified analysis does not exist"},
-                                      context_instance=RequestContext(request))
+            return render(request, "error.html",
+                                      {"error": "The specified analysis does not exist"})
     if enabledconf["elasticsearchdb"]:
         analyses = es.search(
                        index=fullidx,
@@ -1174,18 +1216,18 @@ def remove(request, task_id):
     db = Database()
     db.delete_task(task_id)
 
-    return render_to_response("success_simple.html",
-                              {"message": message},
-                              context_instance=RequestContext(request))
+    return render(request, "success_simple.html",
+                              {"message": message})
 
 @require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def pcapstream(request, task_id, conntuple):
     src, sport, dst, dport, proto = conntuple.split(",")
     sport, dport = int(sport), int(dport)
 
     if enabledconf["mongodb"]:
         conndata = results_db.analysis.find_one({ "info.id": int(task_id) },
-            { "network.tcp": 1, "network.udp": 1},
+            { "network.tcp": 1, "network.udp": 1, "network.sorted_pcap_sha256": 1},
             sort=[("_id", pymongo.DESCENDING)])
 
     if enabledconf["elasticsearchdb"]:
@@ -1196,9 +1238,8 @@ def pcapstream(request, task_id, conntuple):
                  )["hits"]["hits"][0]["_source"]
 
     if not conndata:
-        return render_to_response("standalone_error.html",
-            {"error": "The specified analysis does not exist"},
-            context_instance=RequestContext(request))
+        return render(request, "standalone_error.html",
+            {"error": "The specified analysis does not exist"})
 
     try:
         if proto == "udp": connlist = conndata["network"]["udp"]
@@ -1209,9 +1250,8 @@ def pcapstream(request, task_id, conntuple):
         stream = conns[0]
         offset = stream["offset"]
     except:
-        return render_to_response("standalone_error.html",
-            {"error": "Could not find the requested stream"},
-            context_instance=RequestContext(request))
+        return render(request, "standalone_error.html",
+            {"error": "Could not find the requested stream"})
 
     try:
         # This will check if we have a sorted PCAP
@@ -1222,22 +1262,21 @@ def pcapstream(request, task_id, conntuple):
         fobj = open(pcap_path, "rb")
     except Exception as e:
         #print str(e)
-        return render_to_response("standalone_error.html",
-            {"error": "The required sorted PCAP does not exist"},
-            context_instance=RequestContext(request))
+        return render(request, "standalone_error.html",
+            {"error": "The required sorted PCAP does not exist"})
 
     packets = list(network.packets_for_stream(fobj, offset))
     fobj.close()
 
     return HttpResponse(json.dumps(packets), content_type="application/json")
 
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def comments(request, task_id):
     if request.method == "POST" and settings.COMMENTS:
         comment = request.POST.get("commentbox", "")
         if not comment:
-            return render_to_response("error.html",
-                                      {"error": "No comment provided."},
-                                      context_instance=RequestContext(request))
+            return render(request, "error.html",
+                                      {"error": "No comment provided."})
 
         if enabledconf["mongodb"]:
             report = results_db.analysis.find_one({"info.id": int(task_id)}, sort=[("_id", pymongo.DESCENDING)])
@@ -1286,7 +1325,6 @@ def comments(request, task_id):
         return redirect('analysis.views.report', task_id=task_id)
 
     else:
-        return render_to_response("error.html",
-                                  {"error": "Invalid Method"},
-                                  context_instance=RequestContext(request))
+        return render(request, "error.html",
+                                  {"error": "Invalid Method"})
 

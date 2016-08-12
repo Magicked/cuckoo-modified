@@ -20,7 +20,7 @@ $(function() {
 <div class="row">
     <div class="col-md-6"><p style="margin-bottom: 10px;"><img src="{{ STATIC_URL }}graphic/cuckoo.png" /></p></div>
     {% if analysis.info.category == "file" and analysis.target %}
-    <div class="col-md-6" style="text-align: right;"><a class="btn btn-primary" href="{% url "compare.views.left" analysis.info.id %}">Compare this analysis to...</a></div>
+    <div class="col-md-6" style="text-align: right;"><a class="btn btn-primary" href="{% url "compare_left" analysis.info.id %}">Compare this analysis to...</a></div>
     {% endif %}
 </div>
 <ul class="nav nav-tabs">
@@ -28,18 +28,22 @@ $(function() {
     {% if analysis.static or config.virustotal and analysis.virustotal %}<li><a href="#static" data-toggle="tab">Static Analysis</a></li>{% endif %}
     {% if analysis.behavior.processes %}<li><a href="#behavior" data-toggle="tab" id="graph_hook">Behavioral Analysis</a></li>{% endif %}
     <li><a href="#network" data-toggle="tab">Network Analysis</a></li>
+    {% if analysis.info.category != "pcap" %}
     {% if analysis.dropped|length %}
         <li><a href="#dropped" data-toggle="tab">Dropped Files ({{analysis.dropped|length}})</a></li>
     {% else %}
         <li><a href="#dropped" data-toggle="tab">Dropped Files</a></li>
     {% endif %}
+    {% endif %}
     {% if analysis.procmemory %}<li><a href="#procmemory" data-toggle="tab">Process Memory</a></li>{% endif %}
     {% if analysis.memory %}<li><a href="#memory" data-toggle="tab">Memory Analysis</a></li>{% endif %}
     {% if config.malheur %}
+    {% if analysis.info.category == "file" or analysis.info.category == "url" %}
     {% if similar|length %}
         <li><a href="#similar" data-toggle="tab">Similar ({{similar|length}})</a></li>
     {% else %}
         <li><a href="#similar" data-toggle="tab">Similar</a></li>
+    {% endif %}
     {% endif %}
     {% endif %}
     <li><a href="#reports" data-toggle="tab">Reports</a></li>
@@ -49,6 +53,9 @@ $(function() {
         {% else %}
             <li><a href="#comments" data-toggle="tab">Comments</a></li>
         {% endif %}
+    {% endif %}
+    {% if analysis.misp %}
+            <li><a href="#misp" data-toggle="tab">MISP</a></li>
     {% endif %}
     <li><a href="#statistics" data-toggle="tab">Statistics</a></li>
     <li><a href="#admin" data-toggle="tab">Admin</a></li>
@@ -84,9 +91,11 @@ $(function() {
     </div>
     {% endif %}
     {% if config.malheur %}
+    {% if analysis.info.category == "file" or analysis.info.category == "url" %}
     <div class="tab-pane fade" id="similar">
         {% include "analysis/similar/index.html" %}
     </div>
+    {% endif %}
     {% endif %}
     <div class="tab-pane fade" id="reports">
         {% include "analysis/reports/index.html" %}
@@ -94,6 +103,11 @@ $(function() {
     {% if settings.COMMENTS %}
     <div class="tab-pane fade" id="comments">
         {% include "analysis/comments/index.html" %}
+    </div>
+    {% endif %}
+    {% if analysis.misp %}
+    <div class="tab-pane fade" id="misp">
+        {% include "analysis/misp/index.html" %}
     </div>
     {% endif %}
     <div class="tab-pane fade" id="statistics">

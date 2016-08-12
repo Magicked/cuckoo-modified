@@ -142,7 +142,7 @@ class Syslog(Report):
             else:
                 syslog += 'Total_TCP="0" '
             if "udp" in results["network"]:
-                syslog += 'Total_UDP="' + str(len(results["network"]["udp"])) + '"'
+                syslog += 'Total_UDP="' + str(len(results["network"]["udp"])) + '" '
             else:
                 syslog += 'Total_UDP="0" '
         # VT stats if available
@@ -224,7 +224,7 @@ class Syslog(Report):
             result = self.createLog(results)
         except:
             raise CuckooReportError("Error creating syslog formatted log.")
-			
+
         # Check if the user wants it stored in the reports directory as well
         do_log = self.options.get("logfile", None)
         if do_log:
