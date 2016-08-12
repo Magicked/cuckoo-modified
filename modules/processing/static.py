@@ -3,14 +3,17 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import json
+from lib.cuckoo.common.utils import store_temp_file
 import lib.cuckoo.common.office.olefile as olefile
 import lib.cuckoo.common.office.vbadeobf as vbadeobf
 import lib.cuckoo.common.decoders.darkcomet as darkcomet
 import lib.cuckoo.common.decoders.njrat as njrat
 import lib.cuckoo.common.decoders.nanocore as nanocore
 import lib.cuckoo.common.decoders.alienspy as alienspy
+import lib.cuckoo.common.decoders.qrat as qrat
 import logging
 import os
+import re
 import math
 import array
 import base64
@@ -47,6 +50,12 @@ try:
     HAVE_CRYPTO = True
 except ImportError:
     HAVE_CRYPTO = False
+
+try:
+    from whois import whois
+    HAVE_WHOIS = True
+except:
+    HAVE_WHOIS = False
 
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.constants import CUCKOO_ROOT
@@ -343,7 +352,10 @@ class PortableExecutable(object):
                 symbol = {}
                 symbol["address"] = hex(self.pe.OPTIONAL_HEADER.ImageBase +
                                         exported_symbol.address)
-                symbol["name"] = convert_to_printable(exported_symbol.name)
+                if exported_symbol.name:
+                    symbol["name"] = convert_to_printable(exported_symbol.name)
+                else:
+                    symbol["name"] = ""
                 symbol["ordinal"] = exported_symbol.ordinal
                 exports.append(symbol)
 
@@ -1129,8 +1141,9 @@ class Office(object):
 
 class Java(object):
     """Java Static Analysis"""
-    def __init__(self, file_path):
+    def __init__(self, file_path, decomp_jar):
         self.file_path = file_path
+        self.decomp_jar = decomp_jar
 
     def run(self):
         """Run analysis.
@@ -1141,13 +1154,112 @@ class Java(object):
 
         results = {}
 
+        results["java"] = { }
+        
+        if self.decomp_jar:
+            f = open(self.file_path, "rb")
+            data = f.read()
+            f.close()
+            jar_file = store_temp_file(data, "decompile.jar")
+
+            try:
+                p = Popen(["java", "-jar", self.decomp_jar, jar_file], stdout=PIPE)
+                results["java"]["decompiled"] = convert_to_printable(p.stdout.read())
+            except:
+                pass
+
+            try:
+                os.unlink(jar_file)
+            except:
+                pass
+
         alienspy_config = alienspy.extract_config(self.file_path)
         if alienspy_config:
             results["rat"] = { }
             results["rat"]["name"] = "AlienSpy"
             results["rat"]["config"] = alienspy_config
 
+        qrat_config = qrat.extract_config(self.file_path, self.decomp_jar)
+        if qrat_config:
+            results["rat"] = { }
+            results["rat"]["name"] = "QRat"
+            results["rat"]["config"] = qrat_config
+
         return results
+
+class URL(object):
+    """URL 'Static' Analysis"""
+    def __init__(self, url):
+        self.url = url
+        p = r"^(?:https?:\/\/)?(?:www\.)?(?P<domain>[^:\/\n]+)"
+        dcheck = re.match(p, self.url)
+        if dcheck:
+            self.domain = dcheck.group("domain")
+            # Work around a bug where a "." can tail a url target if
+            # someone accidentally appends one during submission
+            while self.domain.endswith("."):
+                self.domain = self.domain[:-1]
+        else:
+            self.domain = ""
+
+    def run(self):
+        results = {}
+        if self.domain:
+            try:
+                w = whois(self.domain)
+                results["url"] = {}
+                # Create static fields if they don't exist, EG if the WHOIS
+                # data is stale.
+                fields = ['updated_date', 'status', 'name', 'city',
+                          'expiration_date', 'zipcode', 'domain_name',
+                          'country', 'whois_server', 'state', 'registrar',
+                          'referral_url', 'address', 'name_servers', 'org',
+                          'creation_date', 'emails']
+                for field in fields:
+                    if field not in w.keys() or not w[field]:
+                        w[field] = ["None"]
+            except:
+                # No WHOIS data returned
+                log.warning("No WHOIS data for domain: " + self.domain)
+                return results
+
+            # These can be a list or string, just make them all lists
+            for key in w.keys():
+                buf = list()
+                # Handle and format dates
+                if "_date" in key:
+                    if isinstance(w[key], list):
+                        buf = [str(dt).replace("T", " ").split(".")[0]
+                                for dt in w[key]]
+                    else:
+                        buf = [str(w[key]).replace("T", " ").split(".")[0]]
+                else:
+                    if isinstance(w[key], list):
+                        continue
+                    else:
+                        buf = [w[key]]
+                w[key] = buf
+
+            output = ("Name: {0}\nCountry: {1}\nState: {2}\nCity: {3}\n"
+                      "ZIP Code: {4}\nAddress: {5}\n\nOrginization: {6}\n"
+                      "Domain Name(s):\n    {7}\nCreation Date:\n    {8}\n"
+                      "Updated Date:\n    {9}\nExpiration Date:\n    {10}\n"
+                      "Email(s):\n    {11}\n\nRegistrar(s):\n    {12}\nName "
+                      "Server(s):\n    {13}\nReferral URL(s):\n    {14}")
+            output = output.format(w["name"][0], w["country"][0], w["state"][0],
+                         w["city"][0], w["zipcode"][0], w["address"][0],
+                         w["org"][0], "\n    ".join(w["domain_name"]),
+                         "\n    ".join(w["creation_date"]),
+                         "\n    ".join(w["updated_date"]),
+                         "\n    ".join(w["expiration_date"]),
+                         "\n    ".join(w["emails"]),
+                         "\n    ".join(w["registrar"]),
+                         "\n    ".join(w["name_servers"]),
+                         "\n    ".join(w["referral_url"]))
+            results["url"]["whois"] = output
+
+        return results
+
 
 class Static(Processing):
     """Static analysis."""
@@ -1167,19 +1279,26 @@ class Static(Processing):
                     static.update(DotNETExecutable(self.file_path, self.results).run())
             elif "PDF" in thetype or self.task["target"].endswith(".pdf"):
                 static = PDF(self.file_path).run()
-            elif "Word 2007" in thetype or "Excel 2007" in thetype or "PowerPoint 2007" in thetype:
+            elif "Word 2007" in thetype or "Excel 2007" in thetype or "PowerPoint 2007" in thetype or "MIME entity" in thetype:
                 static = Office(self.file_path).run()
             elif "Composite Document File" in thetype:
                 static = Office(self.file_path).run()
-            elif self.task["target"].endswith((".doc", ".docx", ".rtf", ".xls", ".xlsx", ".ppt", ".pptx", ".pps", ".ppsx", ".pptm", ".potm", ".potx", ".ppsm")):
+            elif self.task["target"].endswith((".doc", ".docx", ".rtf", ".xls", ".mht", ".xlsx", ".ppt", ".pptx", ".pps", ".ppsx", ".pptm", ".potm", ".potx", ".ppsm")):
                 static = Office(self.file_path).run()
             elif "Java Jar" in thetype or self.task["target"].endswith(".jar"):
-                static = Java(self.file_path).run()
+                decomp_jar = self.options.get("procyon_path", None)
+                if decomp_jar and not os.path.exists(decomp_jar):
+                    log.error("procyon_path specified in processing.conf but the file does not exist.")
+                static = Java(self.file_path, decomp_jar).run()
             # It's possible to fool libmagic into thinking our 2007+ file is a
             # zip. So until we have static analysis for zip files, we can use
             # oleid to fail us out silently, yeilding no static analysis
             # results for actual zip files.
             elif "Zip archive data, at least v2.0" in thetype:
                 static = Office(self.file_path).run()
+        elif self.task["category"] == "url":
+            enabled_whois = self.options.get("whois", True)
+            if HAVE_WHOIS and enabled_whois:
+                static = URL(self.task["target"]).run()
 
         return static
