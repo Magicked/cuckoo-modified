@@ -56,6 +56,7 @@ SERVICES_PID = None
 MONITORED_SERVICES = False
 MONITORED_WMI = False
 MONITORED_DCOM = False
+MONITORED_BITS = False
 MONITORED_TASKSCHED = False
 LASTINJECT_TIME = None
 NUM_INJECTED = 0
@@ -258,6 +259,7 @@ class PipeHandler(Thread):
         global MONITORED_WMI
         global MONITORED_DCOM
         global MONITORED_TASKSCHED
+        global MONITORED_BITS
         global LASTINJECT_TIME
         global NUM_INJECTED
         try:
@@ -367,12 +369,12 @@ class PipeHandler(Thread):
                         # SW_HIDE
                         si.wShowWindow = 0
                         log.info("Stopping WMI Service")
-                        p = subprocess.Popen(['net', 'stop', 'winmgmt'], startupinfo=si, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT)
-                        dummyvar = p.communicate(input='Y\n')
+                        subprocess.call(['net', 'stop', 'winmgmt', '/y'], startupinfo=si)
                         log.info("Stopped WMI Service")
                         subprocess.call("sc config winmgmt type= own", startupinfo=si)
 
                         if not MONITORED_DCOM:
+                            MONITORED_DCOM = True
                             dcom_pid = pid_from_service_name("DcomLaunch")
                             if dcom_pid:
                                 servproc = Process(pid=dcom_pid,suspended=False)
@@ -406,8 +408,7 @@ class PipeHandler(Thread):
                         # SW_HIDE
                         si.wShowWindow = 0
                         log.info("Stopping Task Scheduler Service")
-                        p = subprocess.Popen(['net', 'stop', 'schedule'], startupinfo=si, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT)
-                        dummyvar = p.communicate(input='Y\n')
+                        subprocess.call(['net', 'stop', 'schedule', '/y'], startupinfo=si)
                         log.info("Stopped Task Scheduler Service")
                         subprocess.call("sc config schedule type= own", startupinfo=si)
 
@@ -419,6 +420,45 @@ class PipeHandler(Thread):
                         if sched_pid:
                             servproc = Process(pid=sched_pid,suspended=False)
                             servproc.set_critical()
+                            filepath = servproc.get_filepath()
+                            servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                            LASTINJECT_TIME = datetime.now()
+                            servproc.close()
+                            KERNEL32.Sleep(2000)
+
+                elif command.startswith("BITS:"):
+                    if not MONITORED_BITS:
+                        MONITORED_BITS = True
+                        si = subprocess.STARTUPINFO()
+                        # STARTF_USESHOWWINDOW
+                        si.dwFlags = 1
+                        # SW_HIDE
+                        si.wShowWindow = 0
+                        log.info("Stopping BITS Service")
+                        subprocess.call(['net', 'stop', 'BITS', '/y'], startupinfo=si)
+                        log.info("Stopped BITS Service")
+                        subprocess.call("sc config BITS type= own", startupinfo=si)
+
+                        if not MONITORED_DCOM:
+                            MONITORED_DCOM = True
+                            dcom_pid = pid_from_service_name("DcomLaunch")
+                            if dcom_pid:
+                                add_critical_pid(dcom_pid)
+                                servproc = Process(pid=dcom_pid,suspended=False)
+                                filepath = servproc.get_filepath()
+                                servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
+                                LASTINJECT_TIME = datetime.now()
+                                servproc.close()
+                                KERNEL32.Sleep(2000)
+
+                        log.info("Starting BITS Service")
+                        subprocess.call("net start BITS", startupinfo=si)
+                        log.info("Started BITS Service")
+
+                        bits_pid = pid_from_service_name("BITS")
+                        if bits_pid:
+                            add_critical_pid(bits_pid)
+                            servproc = Process(pid=bits_pid,suspended=False)
                             filepath = servproc.get_filepath()
                             servproc.inject(dll=DEFAULT_DLL, interest=filepath, nosleepskip=True)
                             LASTINJECT_TIME = datetime.now()
@@ -829,6 +869,12 @@ class Analyzer:
         # Hell yeah.
         log.info("Analysis completed.")
 
+    def get_completion_key(self):
+        if hasattr(self.config, "completion_key"):
+            return self.config.completion_key
+        else:
+            return ""
+
     def run(self):
         """Run analysis.
         @return: operation status.
@@ -1098,13 +1144,13 @@ class Analyzer:
 if __name__ == "__main__":
     success = False
     error = ""
-
+    completion_key = ""
     try:
         # Initialize the main analyzer class.
         analyzer = Analyzer()
-
         # Run it and wait for the response.
         success = analyzer.run()
+        completion_key = analyzer.get_completion_key()
 
     # This is not likely to happen.
     except KeyboardInterrupt:
@@ -1129,4 +1175,4 @@ if __name__ == "__main__":
     finally:
         # Establish connection with the agent XMLRPC server.
         server = xmlrpclib.Server("http://127.0.0.1:8000")
-        server.complete(success, error, PATHS["root"])
+        server.complete(success, error, completion_key)
