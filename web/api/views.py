@@ -25,8 +25,9 @@ from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
 from lib.cuckoo.common.quarantine import unquarantine
 from lib.cuckoo.common.saztopcap import saz_to_pcap
+from lib.cuckoo.common.exceptions import CuckooDemuxError
 from lib.cuckoo.common.utils import store_temp_file, delete_folder
-from lib.cuckoo.common.utils import convert_to_printable, validate_referer
+from lib.cuckoo.common.utils import convert_to_printable, validate_referrer
 from lib.cuckoo.core.database import Database, Task
 from lib.cuckoo.core.database import TASK_REPORTED
 
@@ -42,8 +43,10 @@ if repconf.mongodb.enabled:
                      settings.MONGO_PORT
                  )[settings.MONGO_DB]
 
-if repconf.elasticsearchdb.enabled:
+es_as_db = False
+if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
     from elasticsearch import Elasticsearch
+    es_as_db = True
     baseidx = repconf.elasticsearchdb.index
     fullidx = baseidx + "-*"
     es = Elasticsearch(
@@ -298,7 +301,8 @@ def tasks_create_file(request):
                     path = tmp_path
 
                 for entry in task_machines:
-                    task_ids_new = db.demux_sample_and_add_to_db(file_path=path,
+                    try:
+                        task_ids_new = db.demux_sample_and_add_to_db(file_path=path,
                                           package=package,
                                           timeout=timeout,
                                           priority=priority,
@@ -315,6 +319,11 @@ def tasks_create_file(request):
                                           shrike_sid=shrike_sid,
                                           shrike_refer=shrike_refer
                                           )
+                    except CuckooDemuxError as e:
+                        resp = {"error": True,
+                                "error_value": e}
+                        return jsonize(resp, response=True)
+
                     if task_ids_new:
                         task_ids.extend(task_ids_new)
         else:
@@ -437,7 +446,7 @@ def tasks_create_url(request):
         clock = request.POST.get("clock", None)
         enforce_timeout = bool(request.POST.get("enforce_timeout", False))
         gateway = request.POST.get("gateway",None)
-        referer = validate_referer(request.POST.get("referer",None))
+        referrer = validate_referrer(request.POST.get("referrer",None))
         shrike_url = request.POST.get("shrike_url", None)
         shrike_msg = request.POST.get("shrike_msg", None)
         shrike_sid = request.POST.get("shrike_sid", None)
@@ -473,10 +482,10 @@ def tasks_create_url(request):
                                         ", ".join(vm_list)))}
                 return jsonize(resp, response=True)
 
-        if referer:
+        if referrer:
             if options:
                 options += ","
-            options += "referer=%s" % (referer)
+            options += "referrer=%s" % (referrer)
 
         orig_options = options
 
@@ -509,7 +518,7 @@ def tasks_create_url(request):
                              timeout=timeout,
                              priority=priority,
                              options=options,
-                             machine=machine,
+                             machine=entry,
                              platform=platform,
                              tags=tags,
                              custom=custom,
@@ -886,7 +895,7 @@ def ext_tasks_search(request):
                         "error_value": "Invalid Option. '%s' is not a valid option." % option}
                 return jsonize(resp, response=True)
 
-        if repconf.elasticsearchdb.enabled:
+        if es_as_db:
             if term == "name":
                 records = es.search(index=fullidx, doc_type="analysis", q="target.file.name: %s" % value)["hits"]["hits"]
             elif term == "type":
@@ -959,7 +968,7 @@ def ext_tasks_search(request):
             for results in records:
                 if repconf.mongodb.enabled:
                     ids.append(results["info"]["id"])
-                if repconf.elasticsearchdb.enabled:
+                if es_as_db:
                     ids.append(results["_source"]["info"]["id"])
             resp = {"error": False, "data": ids}
         else:
@@ -1296,7 +1305,7 @@ def tasks_iocs(request, task_id, detail=None):
     buf = {}
     if repconf.mongodb.get("enabled") and not buf:
         buf = results_db.analysis.find_one({"info.id": int(task_id)})
-    if repconf.elasticsearchdb.get("enabled") and not buf:
+    if es_as_db and not buf:
         tmp = es.search(
                   index=fullidx,
                   doc_type="analysis",
@@ -1326,7 +1335,7 @@ def tasks_iocs(request, task_id, detail=None):
     del data["info"]["custom"]
     # The machines key won't exist in cases where an x64 binary is submitted
     # when there are no x64 machines.
-    if "machine" in data["info"]:
+    if "machine" in data["info"] and data["info"]["machine"]:
         del data["info"]["machine"]["manager"]
         del data["info"]["machine"]["label"]
         del data["info"]["machine"]["id"]
@@ -1353,7 +1362,7 @@ def tasks_iocs(request, task_id, detail=None):
         data["network"]["hosts"] = buf["network"]["hosts"]
         data["network"]["domains"] = buf["network"]["domains"]
     data["network"]["ids"] = {}
-    if "suricata" in buf.keys():
+    if "suricata" in buf.keys() and isinstance(buf["suricata"], dict):
         data["network"]["ids"]["totalalerts"] = len(buf["suricata"]["alerts"])
         data["network"]["ids"]["alerts"] = buf["suricata"]["alerts"]
         data["network"]["ids"]["http"] = buf["suricata"]["http"]

@@ -26,8 +26,12 @@ if enabledconf["mongodb"]:
     import pymongo
     results_db = pymongo.MongoClient(settings.MONGO_HOST, settings.MONGO_PORT)[settings.MONGO_DB]
 
+es_as_db = False
 if enabledconf["elasticsearchdb"]:
     from elasticsearch import Elasticsearch
+    es_as_db = True
+    essearch = Config("reporting").elasticsearchdb.searchonly
+    if essearch: es_as_db = False 
     baseidx = Config("reporting").elasticsearchdb.index
     fullidx = baseidx + "-*"
     es = Elasticsearch(
@@ -41,19 +45,19 @@ if enabledconf["elasticsearchdb"]:
 # Conditional decorator for web authentication
 class conditional_login_required(object):
     def __init__(self, dec, condition):
-	self.decorator = dec
-	self.condition = condition
+        self.decorator = dec
+        self.condition = condition
     def __call__(self, func):
-	if not self.condition:
-	    return func
-	return self.decorator(func)
+        if not self.condition:
+            return func
+        return self.decorator(func)
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def left(request, left_id):
     if enabledconf["mongodb"]:
         left = results_db.analysis.find_one({"info.id": int(left_id)}, {"target": 1, "info": 1})
-    if enabledconf["elasticsearchdb"]:
+    if es_as_db:
         hits = es.search(
                    index=fullidx,
                    doc_type="analysis",
@@ -78,7 +82,7 @@ def left(request, left_id):
             },
             {"target": 1, "info": 1}
         )
-    if enabledconf["elasticsearchdb"]:
+    if es_as_db:
         records = list()
         results = es.search(
                       index=fullidx,
@@ -97,7 +101,7 @@ def left(request, left_id):
 def hash(request, left_id, right_hash):
     if enabledconf["mongodb"]:
         left = results_db.analysis.find_one({"info.id": int(left_id)}, {"target": 1, "info": 1})
-    if enabledconf["elasticsearchdb"]:
+    if es_as_db:
         hits = es.search(
                    index=fullidx,
                    doc_type="analysis",
@@ -122,7 +126,7 @@ def hash(request, left_id, right_hash):
             },
             {"target": 1, "info": 1}
         )
-    if enabledconf["elasticsearchdb"]:
+    if es_as_db:
         records = list()
         results = es.search(
                       index=fullidx,
@@ -146,7 +150,7 @@ def both(request, left_id, right_id):
         # Execute comparison.
         counts = compare.helper_percentages_mongo(results_db, left_id, right_id)
         summary_compare = compare.helper_summary_mongo(results_db, left_id, right_id)
-    if enabledconf["elasticsearchdb"]:
+    if es_as_db:
         left = es.search(
                    index=fullidx,
                    doc_type="analysis",

@@ -291,10 +291,27 @@ class vSphere(Machinery):
             raise CuckooMachineError("Snapshot {0} for machine {1} not found"
                                      .format(name, vm.summary.config.name))
 
-        sg = (s.dataKey for s in vm.layoutEx.snapshot if s.key == snapshot)
-        datakey = next(sg, None)
-        fg = (f.name for f in vm.layoutEx.file if f.key == datakey)
-        filespec = next(fg, None)
+        memorykey = datakey = filespec = None
+        for s in vm.layoutEx.snapshot:
+            if s.key == snapshot:
+                memorykey = s.memoryKey
+                datakey = s.dataKey
+                break
+
+        for f in vm.layoutEx.file:
+            if f.key == memorykey and (f.type == "snapshotMemory" or
+                                       f.type == "suspendMemory"):
+                filespec = f.name
+                break
+
+        if not filespec:
+            for f in vm.layoutEx.file:
+                if f.key == datakey and f.type == "snapshotData":
+                    filespec = f.name
+                    break
+
+        if not filespec:
+            raise CuckooMachineError("Could not find memory snapshot file")
 
         log.info("Downloading memory dump {0} to {1}".format(filespec, path))
 
@@ -315,12 +332,15 @@ class vSphere(Machinery):
             response = requests.get(url, params=params, headers=headers,
                                     verify=False, stream=True)
 
+            response.raise_for_status()
+
             with open(path, "wb") as localfile:
                 for chunk in response.iter_content(16*1024):
                     localfile.write(chunk)
-        except:
-            raise CuckooMachineError("Error downloading memory dump {0}"
-                                     .format(filespec))
+
+        except Exception as e:
+            raise CuckooMachineError("Error downloading memory dump {0}: {1}"
+                                     .format(filespec, e))
 
     def _stop_virtual_machine(self, vm):
         """Power off a virtual machine"""

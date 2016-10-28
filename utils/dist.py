@@ -4,6 +4,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import os
+import shutil
 import sys
 import time
 import json
@@ -40,13 +41,18 @@ try:
 except ImportError:
     HAVE_MONGO = False
 
+try:
+    from elasticsearch import Elasticsearch
+    HAVE_ELASTICSEARCH = True
+except ImportError as e:
+    HAVE_ELASTICSEARCH = False
+
 # we need original db to reserve ID in db,
 # to store later report, from master or slave
 cuckoo_conf = Config("cuckoo")
 reporting_conf = Config("reporting")
 
 INTERVAL = 10
-MINIMUMQUEUE = 5
 RESET_LASTCHECK = 20
 
 # controller of dead nodes
@@ -107,6 +113,11 @@ class Retriever(object):
 
     def starter(self):
         """ Method that runs forever """
+        with app.app_context():
+            tasks = Task.query.filter_by(retrieved=False, finished=True).order_by(Task.id.asc()).all()
+            for task in tasks:
+                self.queue.put((task.id, task.task_id, task.node_id, task.main_task_id))
+
         threads = []
         while True:
             if not self.queue.empty() and len(threads) < self.threads_number:
@@ -122,7 +133,7 @@ class Retriever(object):
                     if not thread.isAlive():
                         thread.join()
                         threads.remove(thread)
-         
+
     def downloader(self, dist_id, task_id, node_id, main_task_id):
         with app.app_context():
             try:
@@ -140,7 +151,7 @@ class Retriever(object):
                     all_files_tar = StringIO.StringIO(all_files_tar)
                     all_files = tarfile.open(fileobj=all_files_tar, mode="r:bz2")
                     all_files.extractall(report_path)
- 
+
                     all_files.close()
                     all_files_tar.close()
 
@@ -170,10 +181,10 @@ class Retriever(object):
 
                 else:
                     log.debug("Error fetching %s report for task #%d",
-                              "dist", task.task_id)
+                              "dist2", task_id)
 
             except Exception as e:
-                logging.info(e)
+                logging.info("Can not fetch dist2 report for Web Task: main_task_id: %d. Error: %s" % (main_task_id, e))
 
         return
 
@@ -237,7 +248,7 @@ class Node(db.Model):
             log.info("[Node %s] Could not delete VM: %s" % (self.name, name) )
             return False
 
-    
+
 
     def status(self):
         try:
@@ -282,10 +293,14 @@ class Node(db.Model):
                                 verify = False)
 
                 # Zip files preprocessed, so only one id
-                task.task_id = r.json()["task_ids"][0]
+                if r and r.status_code == 200 and "task_ids" in r.json() and len(r.json()["task_ids"]) > 0:
+                    task.task_id = r.json()["task_ids"][0]
+                    log.info(task.task_id)
+                else:
+                    return
 
             task.node_id = self.id
-            
+
             if task.main_task_id:
                 main_db.set_status(task.main_task_id, TASK_RUNNING)
 
@@ -427,7 +442,7 @@ class StatusThread(threading.Thread):
         q = Task.query.filter(or_(Task.node_id==None, Task.task_id==None), Task.finished==False)
 
         # Order by task priority and task id.
-        q = q.order_by(-Task.priority, -Task.id)
+        q = q.order_by(-Task.priority, Task.main_task_id)
 
         # Get available node tags
         machines = Machine.query.filter_by(node_id=node.id).all()
@@ -460,6 +475,44 @@ class StatusThread(threading.Thread):
         if pend_tasks_num > 0:
             for task in q.limit(pend_tasks_num).all():
                 node.submit_task(task)
+
+    def do_es(self, results, t):
+        if HAVE_ELASTICSEARCH:
+            try:
+                es = Elasticsearch(
+                    hosts = [{
+                        'host': reporting_conf.elasticsearchdb.host,
+                        'port': reporting_conf.elasticsearchdb.port,
+                    }],
+                    timeout = 60
+                )
+            except Exception as e:
+                logging.error("Cannot connect to ElasticSearch DB")
+                return
+
+            try:
+                index_prefix  = reporting_conf.elasticsearchdb.index
+
+                idxdate = results["info"]["started"].split(" ")[0]
+                index_name = '{0}-{1}'.format(index_prefix, idxdate)
+            except Exception as e:
+                log.info("Failed to set ES index: %s" % e)
+
+            try:
+                report = {}
+                report["task_id"] = t.main_task_id
+                report["info"]    = results.get("info")
+                report["target"]  = results.get("target")
+                report["summary"] = results.get("behavior", {}).get("summary")
+                report["network"] = results.get("network")
+                report["virustotal"] = results.get("virustotal")
+                report["virustotal_summary"] = "%s/%s" % ( results.get("virustotal", {}).get("positives") , \
+                                                           results.get("virustotal", {}).get("total") )
+            except Exception as e:
+                log.info("Failed to create ES entry: %s" % e)
+
+            # Store the report and retrieve its object id.
+            es.index(index=index_name, doc_type="analysis", id=t.main_task_id, body=report)
 
     def do_mongo(self, report_mongo, report, t, node):
 
@@ -526,7 +579,11 @@ class StatusThread(threading.Thread):
         # Fetch the latest reports.
         for task in node.fetch_tasks("reported", since=last_check):
             q = Task.query.filter_by(node_id=node.id, task_id=task["id"], finished=False)
-            t = q.first()
+            # In the case that a Cuckoo node has been reset over time it's
+            # possible that there are multiple combinations of
+            # node-id/task-id, in this case we take the last one available.
+            # (This makes it possible to re-setup a Cuckoo node).
+            t = q.order_by(Task.id.desc()).first()
 
             if t is None:
                 continue
@@ -564,10 +621,10 @@ class StatusThread(threading.Thread):
                         report_mongo = file.extractfile("mongo.json")
                         report_mongo = report_mongo.read()
                         report_mongo = loads(report_mongo)
-                            
+
                         to_extract = file.getmembers()
-                        to_extract = [to_extract.remove(file_inside) 
-                                        if file_inside.name == 'mongo.json' else file_inside 
+                        to_extract = [to_extract.remove(file_inside)
+                                        if file_inside.name == 'mongo.json' else file_inside
                                         for file_inside in to_extract]
                         to_extract = filter(None, to_extract)
 
@@ -582,8 +639,10 @@ class StatusThread(threading.Thread):
 
                             if report_mongo and report:
                                 self.do_mongo(report_mongo, report, t, node)
+                                if reporting_conf.elasticsearchdb.searchonly and reporting_conf.elasticsearchdb.enabled:
+                                    self.do_es(report, t)
                                 finished = True
-                                
+
                                 # move file here from slaves
                                 retrieve.queue.put((t.id, t.task_id, t.node_id, t.main_task_id))
 
@@ -596,18 +655,17 @@ class StatusThread(threading.Thread):
 
                                     destination = os.path.join(destination, sample_sha256)
                                     if not os.path.exists(destination):
-                                        os.rename(t.path, destination)
-                                    os.remove(t.path)
+                                        shutil.move(t.path, destination)
                                     # creating link to analysis folder
                                     os.symlink(destination, os.path.join(report_path, "binary"))
                                 except Exception as e:
-                                        logging.error(e)
+                                    logging.error(e)
 
                         # closing StringIO objects
                         fileobj.close()
 
                     except Exception as e:
-                        log.info(e)
+                        log.info("Exception: %s" % e)
 
                 del temp_f
 
@@ -617,16 +675,17 @@ class StatusThread(threading.Thread):
                 db.session.refresh(t)
 
     def run(self):
-        
+
         global queue
         global main_db
         global retrieve
         global STATUSES
         global RESET_LASTCHECK
+        MINIMUMQUEUE = dict()
 
         # run once
         with app.app_context():
-            # handle another user case, 
+            # handle another user case,
             # when master used to only store data and not process samples
             master_storage_only = False
             master = Node.query.filter_by(name="master").first()
@@ -634,6 +693,10 @@ class StatusThread(threading.Thread):
                 master_storage_only = True
             elif Machine.query.filter_by(node_id=master.id).count() == 0:
                 master_storage_only = True
+
+            #MINIMUMQUEUE but per Node depending of number vms
+            for node in Node.query.filter_by(enabled=True).all():
+                MINIMUMQUEUE[node.name] = Machine.query.filter_by(node_id=node.id).count()
 
         threads_number = 5
         if reporting_conf.distributed.retriever_threads:
@@ -680,9 +743,10 @@ class StatusThread(threading.Thread):
                     # elif -  master also analyze samples, check master queue
                     # send tasks to slaves if master queue has extra tasks(pending)
                     if master_storage_only:
-                        self.submit_tasks(node, MINIMUMQUEUE - status["pending"])
-                    elif statuses.get("master", {}).get("pending", 0) > MINIMUMQUEUE and status["pending"] < MINIMUMQUEUE:
-                        self.submit_tasks(node, MINIMUMQUEUE - status["pending"])
+                        self.submit_tasks(node, MINIMUMQUEUE[node.name] - status["pending"])
+                    elif statuses.get("master", {}).get("pending", 0) > MINIMUMQUEUE.get("master", 0) and \
+                         status["pending"] < MINIMUMQUEUE[node.name]:
+                        self.submit_tasks(node, MINIMUMQUEUE[node.name] - status["pending"])
 
                     if node.last_check:
                         last_check = int(node.last_check.strftime("%s"))
@@ -700,8 +764,8 @@ class StatusThread(threading.Thread):
                         status["pending"] == 0 and \
                         status["running"] == 0 and \
                         status["completed"] == 0 and \
-                        status_count[node.name] < RESET_LASTCHECK: 
-                        
+                        status_count[node.name] < RESET_LASTCHECK:
+
                         node.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     # We just fetched all the "latest" tasks. However, it is
@@ -770,6 +834,9 @@ class NodeRootApi(NodeBaseApi):
         args = self._parser.parse_args()
         node = Node(name=args["name"], url=args["url"], ht_user=args["ht_user"],
                 ht_pass=args["ht_pass"])
+
+        if Node.query.filter_by(name=args["name"]).first():
+            return dict(success=False, message="Node called %s already exists" % args["name"])
 
         machines = []
         for machine in node.list_machines():
@@ -909,16 +976,10 @@ class DistRestApi(RestApi):
             "application/json": output_json,
         }
 
-def check_pending_retrieves(app):
-    with app.app_context():
-        tasks = Task.query.filter_by(retrieved=False, finished=True).all()
-        for task in tasks:
-            retrieve.queue.put((task.id, task.task_id, task.node_id, task.main_task_id))
-
 def update_machine_table(app, node_name):
     with app.app_context():
         node = Node.query.filter_by(name=node_name).first()
-        
+
         # get new vms
         new_machines = node.list_machines()
 
@@ -976,7 +1037,8 @@ def create_app(database_connection):
 
     return app
 
-# init 
+# init
+logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("cuckoo.distributed")
@@ -1015,13 +1077,13 @@ if __name__ == "__main__":
             update_machine_table(app, args.node)
 
     elif reporting_conf.distributed.samples_directory:
-        
+
         if not reporting_conf.distributed.samples_directory:
                 p.error("Configure conf/reporting.conf distributed section please")
 
         if not os.path.isdir(reporting_conf.distributed.samples_directory):
             os.makedirs(reporting_conf.distributed.samples_directory)
-        
+
         if reporting_conf.distributed.samples_directory:
             app.config["SAMPLES_DIRECTORY"] = reporting_conf.distributed.samples_directory
             app.config["UPTIME_LOGFILE"] = reporting_conf.distributed.uptime_logfile
@@ -1029,9 +1091,6 @@ if __name__ == "__main__":
         t = StatusThread()
         t.daemon = True
         t.start()
-
-        # will generate queue with all pend retrieve tasks
-        check_pending_retrieves(app)
 
         app.run(host=args.host, port=args.port)
 
@@ -1043,7 +1102,7 @@ else:
 
     if not os.path.isdir(reporting_conf.distributed.samples_directory):
         os.makedirs(reporting_conf.distributed.samples_directory)
-            
+
     if reporting_conf.distributed.samples_directory:
         app.config["SAMPLES_DIRECTORY"] = reporting_conf.distributed.samples_directory
         app.config["UPTIME_LOGFILE"] = reporting_conf.distributed.uptime_logfile
@@ -1051,6 +1110,3 @@ else:
     t = StatusThread()
     t.daemon = True
     t.start()
-
-    # will generate queue with all pend retrieve tasks
-    check_pending_retrieves(app)

@@ -21,9 +21,10 @@ from django.contrib.auth.decorators import login_required
 sys.path.append(settings.CUCKOO_PATH)
 
 from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.utils import store_temp_file, validate_referer
+from lib.cuckoo.common.utils import store_temp_file, validate_referrer
 from lib.cuckoo.common.quarantine import unquarantine
-from lib.cuckoo.common.saztopcap import saz_to_pcap 
+from lib.cuckoo.common.saztopcap import saz_to_pcap
+from lib.cuckoo.common.exceptions import CuckooDemuxError
 from lib.cuckoo.core.database import Database
 
 # Conditional decorator for web authentication
@@ -69,16 +70,16 @@ def index(request):
         custom = request.POST.get("custom", "")
         memory = bool(request.POST.get("memory", False))
         enforce_timeout = bool(request.POST.get("enforce_timeout", False))
-        referer = validate_referer(request.POST.get("referer", None))
+        referrer = validate_referrer(request.POST.get("referrer", None))
         tags = request.POST.get("tags", None)
 
         task_gateways = []
         ipaddy_re = re.compile(r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
 
-        if referer:
+        if referrer:
             if options:
                 options += ","
-            options += "referer=%s" % (referer)
+            options += "referrer=%s" % (referrer)
 
         if request.POST.get("free"):
             if options:
@@ -161,9 +162,13 @@ def index(request):
                     options = update_options(gw, orig_options)
 
                     for entry in task_machines:
-                        task_ids_new = db.demux_sample_and_add_to_db(file_path=path, package=package, timeout=timeout, options=options, priority=priority,
-                                                                     machine=entry, custom=custom, memory=memory, enforce_timeout=enforce_timeout, tags=tags, clock=clock)
-                        task_ids.extend(task_ids_new)
+                        try:
+                            task_ids_new = db.demux_sample_and_add_to_db(file_path=path, package=package, timeout=timeout, options=options, priority=priority,
+                                    machine=entry, custom=custom, memory=memory, enforce_timeout=enforce_timeout, tags=tags, clock=clock)
+                            task_ids.extend(task_ids_new)
+                        except CuckooDemuxError as err:
+                            return render(request, "error.html", {"error": err})
+
         elif "quarantine" in request.FILES:
             samples = request.FILES.getlist("quarantine")
             for sample in samples:
@@ -387,7 +392,7 @@ def status(request, task_id):
 
     completed = False
     if task.status == "reported":
-        return redirect('analysis.views.report', task_id=task_id)
+        return redirect('report', task_id=task_id)
 
     status = task.status
     if status == "completed":
