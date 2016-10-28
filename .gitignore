@@ -34,13 +34,8 @@ cuckoo.v12.suo
 data/yara/index_*.yar
 UpgradeLog.htm
 
-*.ashland
-
 modules/signatures/*
 modules/feeds/*
 
 shares/
 software/
-
-# Ignore specific configuration files
-conf/
